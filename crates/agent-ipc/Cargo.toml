@@ -1,0 +1,11 @@
+[package]
+name = "agent-ipc"
+version = "0.1.0"
+edition = "2021"
+description = "Shared channel contract between kernel and all frontends: UiCommand/UiEvent/AgentEvent + wire codec"
+license = "MIT"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

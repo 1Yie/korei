@@ -1,0 +1,24 @@
+[package]
+name = "agent-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Pure async orchestration engine: tool registry, ReAct loop, permissions, compaction — no iced, no reqwest"
+license = "MIT"
+
+[dependencies]
+agent-tool = { path = "../agent-tool", version = "0.1.0" }
+agent-llm-core = { path = "../agent-llm-core", version = "0.1.0" }
+agent-ipc = { path = "../agent-ipc", version = "0.1.0" }
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+schemars.workspace = true
+
+[dev-dependencies]
+agent-testkit = { path = "../agent-testkit" }
+async-trait.workspace = true

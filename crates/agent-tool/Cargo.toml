@@ -1,0 +1,13 @@
+[package]
+name = "agent-tool"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The contract names no product. `agent-llm-core` is a leaf (the wire types a tool
+# result can carry); everything else is a third-party crate.
+agent-llm-core = { path = "../agent-llm-core", version = "0.1.0" }
+futures.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+thiserror.workspace = true

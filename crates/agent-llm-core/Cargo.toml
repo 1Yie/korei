@@ -1,0 +1,22 @@
+[package]
+name = "agent-llm-core"
+version = "0.1.0"
+edition = "2021"
+description = "LLM provider contract: normalized StreamChunk/ChatMessage types, LlmProvider trait, sampler, egress masking. No vendor SDK, no HTTP client, no credential store."
+license = "MIT"
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+base64.workspace = true
+
+[dependencies.tokio]
+workspace = true
+features = ["time"]
+
+[dev-dependencies]

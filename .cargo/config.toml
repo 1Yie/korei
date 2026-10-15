@@ -1,0 +1,8 @@
+# Rust builds may use at most ~20% of this machine (20 cores → 4 jobs) so the
+# desktop and other work stay responsive. `jobs` caps parallel rustc/linker
+# processes; RUST_TEST_THREADS caps the in-process test harness the same way.
+[build]
+jobs = 4
+
+[env]
+RUST_TEST_THREADS = "4"
