@@ -144,29 +144,15 @@ impl Sampler {
     /// One full request with retry/doom-loop policy. Calls `on_chunk` per
     /// chunk and `on_event` for policy events; returns the assembled text.
     ///
+    /// `on_idle` is called every [`IDLE_TICK`] while the stream is quiet. A
+    /// caller that coalesces chunks (the engine batches text for the UI)
+    /// flushes its buffer there, so what the model already sent is not
+    /// stranded until the next chunk — or a cancel — shakes it loose.
+    ///
     /// Chunk ordering guarantee: `Done` reaches `on_chunk` exactly once per
     /// attempt, so the caller treats `Err` from this function as the attempt
     /// boundary, not a missing `Done`.
-    pub async fn sample<F, G>(
-        &self,
-        req: SampleRequest<'_>,
-        messages: &[ChatMessage],
-        on_chunk: F,
-        on_event: G,
-    ) -> Result<(), SampleError>
-    where
-        F: FnMut(&StreamChunk),
-        G: FnMut(&SamplerEvent),
-    {
-        self.sample_with_idle(req, messages, on_chunk, on_event, || {})
-            .await
-    }
-
-    /// [`Sampler::sample`] plus `on_idle`, called every [`IDLE_TICK`] while the
-    /// stream is quiet. A caller that coalesces chunks (the engine batches text
-    /// for the UI) flushes its buffer here, so what the model already sent is
-    /// not stranded until the next chunk — or a cancel — shakes it loose.
-    pub async fn sample_with_idle<F, G, I>(
+    pub async fn sample<F, G, I>(
         &self,
         req: SampleRequest<'_>,
         messages: &[ChatMessage],
@@ -681,7 +667,7 @@ mod tests {
 
         let messages = vec![ChatMessage::user(format!("my key is {secret}, use it"))];
         sampler
-            .sample(req(), &messages, |_| {}, |_| {})
+            .sample(req(), &messages, |_| {}, |_| {}, || {})
             .await
             .expect("sample");
 
@@ -718,6 +704,7 @@ mod tests {
                     }
                 },
                 |e| events.push(format!("{e:?}")),
+                || {},
             )
             .await
             .expect("the backup must answer");
@@ -744,7 +731,7 @@ mod tests {
         sampler.set_fallbacks(vec![("backup".into(), backup.clone())]);
 
         let err = sampler
-            .sample(req(), &[], |_| {}, |_| {})
+            .sample(req(), &[], |_| {}, |_| {}, || {})
             .await
             .unwrap_err();
         assert!(err.to_string().contains("400"), "{err}");
@@ -773,7 +760,7 @@ mod tests {
         sampler.set_fallbacks(vec![("backup".into(), backup)]);
 
         let err = sampler
-            .sample(req(), &[], |_| {}, |_| {})
+            .sample(req(), &[], |_| {}, |_| {}, || {})
             .await
             .unwrap_err();
         assert!(err.to_string().contains("502"), "{err}");
@@ -801,6 +788,7 @@ mod tests {
                     }
                 },
                 |e| events.push(format!("{e:?}")),
+                || {},
             )
             .await
             .expect("retry must recover");
@@ -829,7 +817,7 @@ mod tests {
 
         let mut events: Vec<String> = Vec::new();
         let err = sampler
-            .sample(req(), &[], |_| {}, |e| events.push(format!("{e:?}")))
+            .sample(req(), &[], |_| {}, |e| events.push(format!("{e:?}")), || {})
             .await
             .unwrap_err();
 
@@ -848,7 +836,7 @@ mod tests {
         ]);
         let sampler = Sampler::new(p.clone());
         sampler
-            .sample(req(), &[], |_| {}, |_| {})
+            .sample(req(), &[], |_| {}, |_| {}, || {})
             .await
             .expect("establish retry recovers");
         assert_eq!(p.calls.load(Ordering::SeqCst), 2);
@@ -867,7 +855,7 @@ mod tests {
 
         let mut events: Vec<String> = Vec::new();
         let err = sampler
-            .sample(req(), &[], |_| {}, |e| events.push(format!("{e:?}")))
+            .sample(req(), &[], |_| {}, |e| events.push(format!("{e:?}")), || {})
             .await
             .unwrap_err();
 
@@ -904,6 +892,7 @@ mod tests {
                     }
                 },
                 |_| {},
+                || {},
             )
             .await
             .unwrap();
@@ -923,6 +912,7 @@ mod tests {
                     }
                 },
                 |_| {},
+                || {},
             )
             .await
             .unwrap();
@@ -956,6 +946,7 @@ mod tests {
                     }
                 },
                 |_| {},
+                || {},
             )
             .await
             .expect("error chunk is retryable and recovers");

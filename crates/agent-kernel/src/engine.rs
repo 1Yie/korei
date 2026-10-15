@@ -737,7 +737,7 @@ impl Engine {
                 _ = cancel_watch => {
                     Err(agent_llm_core::sampler::SampleError::Stream(CANCEL_ERR.into()))
                 }
-                r = self.sampler.sample_with_idle(
+                r = self.sampler.sample(
                     req,
                     wire_messages,
                     |chunk| {
@@ -1637,6 +1637,7 @@ impl Engine {
                         retry_reset.store(true, std::sync::atomic::Ordering::Relaxed);
                     }
                 },
+                || {},
             )
             .await
             .map_err(|e| e.to_string())?;
