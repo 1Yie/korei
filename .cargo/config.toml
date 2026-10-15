@@ -6,3 +6,6 @@ jobs = 4
 
 [env]
 RUST_TEST_THREADS = "4"
+
+[net]
+git-fetch-with-cli = true
