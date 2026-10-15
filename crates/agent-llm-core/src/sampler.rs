@@ -55,6 +55,11 @@ pub enum SampleError {
     Stream(String),
 }
 
+/// How often the sampler calls `on_idle` while it waits for the next chunk.
+/// Short enough that a coalescing buffer holding already-received text can be
+/// flushed promptly when the stream goes quiet.
+pub const IDLE_TICK: Duration = Duration::from_millis(40);
+
 /// Events the sampler emits *besides* model chunks — surfaced to the UI as
 /// `system` messages so degrade is visible, never silent.
 #[derive(Debug, Clone)]
@@ -146,12 +151,33 @@ impl Sampler {
         &self,
         req: SampleRequest<'_>,
         messages: &[ChatMessage],
-        mut on_chunk: F,
-        mut on_event: G,
+        on_chunk: F,
+        on_event: G,
     ) -> Result<(), SampleError>
     where
         F: FnMut(&StreamChunk),
         G: FnMut(&SamplerEvent),
+    {
+        self.sample_with_idle(req, messages, on_chunk, on_event, || {})
+            .await
+    }
+
+    /// [`Sampler::sample`] plus `on_idle`, called every [`IDLE_TICK`] while the
+    /// stream is quiet. A caller that coalesces chunks (the engine batches text
+    /// for the UI) flushes its buffer here, so what the model already sent is
+    /// not stranded until the next chunk — or a cancel — shakes it loose.
+    pub async fn sample_with_idle<F, G, I>(
+        &self,
+        req: SampleRequest<'_>,
+        messages: &[ChatMessage],
+        mut on_chunk: F,
+        mut on_event: G,
+        mut on_idle: I,
+    ) -> Result<(), SampleError>
+    where
+        F: FnMut(&StreamChunk),
+        G: FnMut(&SamplerEvent),
+        I: FnMut(),
     {
         // Primary first, then the degrade chain in config order. A provider
         // that exhausts its retries hands the request to the next one; a
@@ -161,7 +187,14 @@ impl Sampler {
         let mut hop = 0usize;
         loop {
             match self
-                .sample_with(&current.1, &req, messages, &mut on_chunk, &mut on_event)
+                .sample_with(
+                    &current.1,
+                    &req,
+                    messages,
+                    &mut on_chunk,
+                    &mut on_event,
+                    &mut on_idle,
+                )
                 .await
             {
                 Err(SampleError::Exhausted { .. }) if hop < self.fallbacks.len() => {
@@ -180,21 +213,26 @@ impl Sampler {
 
     /// The retry policy against one provider: transient failures back off and
     /// retry the same request, up to [`MAX_RETRIES`] attempts.
-    async fn sample_with<F, G>(
+    async fn sample_with<F, G, I>(
         &self,
         provider: &Arc<dyn LlmProvider>,
         req: &SampleRequest<'_>,
         messages: &[ChatMessage],
         on_chunk: &mut F,
         on_event: &mut G,
+        on_idle: &mut I,
     ) -> Result<(), SampleError>
     where
         F: FnMut(&StreamChunk),
         G: FnMut(&SamplerEvent),
+        I: FnMut(),
     {
         let mut attempt = 0u32;
         loop {
-            match self.sample_once(provider, req, messages, on_chunk).await {
+            match self
+                .sample_once(provider, req, messages, on_chunk, on_idle)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(e) if !e.retryable() => return Err(e),
                 Err(e) => {
@@ -223,15 +261,17 @@ impl Sampler {
     /// of the request messages before they hit the wire; **stream salvage**
     /// returns the partial text alongside the error so the caller can keep
     /// it visible + retry with a continuation prompt.
-    async fn sample_once<F>(
+    async fn sample_once<F, I>(
         &self,
         provider: &Arc<dyn LlmProvider>,
         req: &SampleRequest<'_>,
         messages: &[ChatMessage],
         on_chunk: &mut F,
+        on_idle: &mut I,
     ) -> Result<(), SampleError>
     where
         F: FnMut(&StreamChunk),
+        I: FnMut(),
     {
         // Egress mask: scrub secrets from outbound messages (defense in
         // depth — sandbox env sanitize is the first wall, this is second).
@@ -282,7 +322,20 @@ impl Sampler {
         let mut done_seen = false;
 
         loop {
-            let next = tokio::time::timeout(IDLE_TIMEOUT, stream.next()).await;
+            // Wait for the next chunk in short ticks so the caller can flush
+            // text it is still holding while the stream is quiet; the overall
+            // idle ceiling is unchanged.
+            let idle_since = tokio::time::Instant::now();
+            let next = loop {
+                let remaining = IDLE_TIMEOUT.saturating_sub(idle_since.elapsed());
+                if remaining.is_zero() {
+                    break Err(());
+                }
+                match tokio::time::timeout(IDLE_TICK.min(remaining), stream.next()).await {
+                    Ok(item) => break Ok(item),
+                    Err(_) => on_idle(),
+                }
+            };
             let chunk = match next {
                 Err(_) => return Err(SampleError::IdleTimeout),
                 Ok(None) => break,

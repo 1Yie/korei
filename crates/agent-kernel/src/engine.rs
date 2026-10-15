@@ -685,10 +685,9 @@ impl Engine {
             // flush at ~120 bytes, after 40ms, or on any non-delta chunk so the
             // bounded UI channel never sees a per-token burst large
             // enough to push out control events via try_send.
-            let mut pending_text_delta = String::new();
-            let mut pending_reasoning_delta = String::new();
-            let mut text_flushed_at = std::time::Instant::now();
-            let mut reasoning_flushed_at = std::time::Instant::now();
+            // Shared by the chunk callback and the idle tick, hence the lock (the
+            // boxed future must be Send; it is never contended).
+            let coalesce = std::sync::Mutex::new(DeltaBuffers::new());
             // A provider-level `StreamChunk::Error` (e.g. devin's
             // `internal_server_error … upstream error`) arrives inside the
             // stream, not as a transport `Err` — without this flag the turn
@@ -738,7 +737,7 @@ impl Engine {
                 _ = cancel_watch => {
                     Err(agent_llm_core::sampler::SampleError::Stream(CANCEL_ERR.into()))
                 }
-                r = self.sampler.sample(
+                r = self.sampler.sample_with_idle(
                     req,
                     wire_messages,
                     |chunk| {
@@ -747,8 +746,7 @@ impl Engine {
                             round_reasoning.clear();
                             reasoning_first = None;
                             reasoning_last = 0;
-                            pending_text_delta.clear();
-                            pending_reasoning_delta.clear();
+                            coalesce.lock().unwrap_or_else(|e| e.into_inner()).clear();
                             assembler = ToolCallAssembler::new();
                             saw_done = false;
                             stream_error = None;
@@ -757,35 +755,24 @@ impl Engine {
                         match chunk {
                             StreamChunk::ReasoningDelta(t) => {
                                 round_reasoning.push_str(t);
-                                pending_reasoning_delta.push_str(t);
+                                coalesce.lock().unwrap_or_else(|e| e.into_inner()).reasoning.push_str(t);
                                 let now = agent_llm_core::types::now_ms();
                                 if reasoning_first.is_none() {
                                     reasoning_first = Some(now);
                                 }
                                 reasoning_last = now;
-                                if should_flush_delta(
-                                    pending_reasoning_delta.len(),
-                                    reasoning_flushed_at.elapsed(),
-                                ) {
-                                    reasoning_flushed_at = std::time::Instant::now();
+                                if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_reasoning(false) {
                                     let _ = io.ui_tx.send(UiEvent::ReasoningDelta {
-                                        text: std::mem::take(&mut pending_reasoning_delta),
+                                        text,
                                         parent: None,
                                     });
                                 }
                             }
                             StreamChunk::ContentDelta(t) => {
                                 round_text.push_str(t);
-                                pending_text_delta.push_str(t);
-                                if should_flush_delta(
-                                    pending_text_delta.len(),
-                                    text_flushed_at.elapsed(),
-                                ) {
-                                    text_flushed_at = std::time::Instant::now();
-                                    let _ = io.ui_tx.send(UiEvent::TextDelta {
-                                        text: std::mem::take(&mut pending_text_delta),
-                                        parent: None,
-                                    });
+                                coalesce.lock().unwrap_or_else(|e| e.into_inner()).text.push_str(t);
+                                if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_text(false) {
+                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
                                 }
                             }
                             StreamChunk::ToolCallDelta { .. } => {
@@ -796,17 +783,11 @@ impl Engine {
                                 // Flush any coalesced deltas BEFORE the
                                 // terminal event lands so the UI never
                                 // renders trailing text after Finished.
-                                if !pending_text_delta.is_empty() {
-                                    let _ = io.ui_tx.send(UiEvent::TextDelta {
-                                        text: std::mem::take(&mut pending_text_delta),
-                                        parent: None,
-                                    });
+                                if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_text(true) {
+                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
                                 }
-                                if !pending_reasoning_delta.is_empty() {
-                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta {
-                                        text: std::mem::take(&mut pending_reasoning_delta),
-                                        parent: None,
-                                    });
+                                if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_reasoning(true) {
+                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None });
                                 }
                                 if let (Some(p), Some(c)) = (prompt_tokens, completion_tokens) {
                                     let cached = cached_tokens.unwrap_or(0);
@@ -825,17 +806,11 @@ impl Engine {
                             }
                             StreamChunk::Error(e) => {
                                 stream_error = Some(e.clone());
-                                if !pending_text_delta.is_empty() {
-                                    let _ = io.ui_tx.send(UiEvent::TextDelta {
-                                        text: std::mem::take(&mut pending_text_delta),
-                                        parent: None,
-                                    });
+                                if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_text(true) {
+                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
                                 }
-                                if !pending_reasoning_delta.is_empty() {
-                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta {
-                                        text: std::mem::take(&mut pending_reasoning_delta),
-                                        parent: None,
-                                    });
+                                if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_reasoning(true) {
+                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None });
                                 }
                                 // The `*[error: e]*` marker + turn-end `Error` event
                                 // report this — no extra SystemMessage (it printed
@@ -856,23 +831,36 @@ impl Engine {
                         let _ = io.ui_tx.send(UiEvent::SystemMessage(t.clone()));
                         policy_notes.push(t);
                     },
+                    || {
+                        // The stream is quiet. Whatever it already delivered is
+                        // still sitting in the coalescing buffers (a flush only
+                        // happens when the NEXT chunk arrives), so a model that
+                        // stalls mid-sentence would freeze the reply on screen
+                        // until the user cancels. Push it out now.
+                        let mut c = coalesce.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(text) = c.take_text(false) {
+                            let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
+                        }
+                        if let Some(text) = c.take_reasoning(false) {
+                            let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None });
+                        }
+                    },
                 ) => r,
             };
 
             // Flush any sub-threshold deltas left after the sample
             // returned — a stream that ended cleanly before hitting 120
             // chars would otherwise strand its tail in the buffer.
-            if !pending_text_delta.is_empty() {
-                let _ = io.ui_tx.send(UiEvent::TextDelta {
-                    text: std::mem::take(&mut pending_text_delta),
-                    parent: None,
-                });
-            }
-            if !pending_reasoning_delta.is_empty() {
-                let _ = io.ui_tx.send(UiEvent::ReasoningDelta {
-                    text: std::mem::take(&mut pending_reasoning_delta),
-                    parent: None,
-                });
+            {
+                let mut c = coalesce.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(text) = c.take_text(true) {
+                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
+                }
+                if let Some(text) = c.take_reasoning(true) {
+                    let _ = io
+                        .ui_tx
+                        .send(UiEvent::ReasoningDelta { text, parent: None });
+                }
             }
 
             // Persist the sampler policy notices — they replayed live,
@@ -1798,6 +1786,53 @@ fn extract_attached_images(text: &str) -> Vec<agent_llm_core::types::ImageRef> {
 /// the UI idle until a size threshold fills either.
 const DELTA_FLUSH_BYTES: usize = 120;
 const DELTA_FLUSH_AFTER: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// The text and reasoning deltas waiting to be sent to the UI, with the time
+/// each side last flushed.
+struct DeltaBuffers {
+    text: String,
+    reasoning: String,
+    text_flushed_at: std::time::Instant,
+    reasoning_flushed_at: std::time::Instant,
+}
+
+impl DeltaBuffers {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            text: String::new(),
+            reasoning: String::new(),
+            text_flushed_at: now,
+            reasoning_flushed_at: now,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.reasoning.clear();
+    }
+
+    /// The pending text if it is due (or `force`d), leaving the buffer empty.
+    fn take_text(&mut self, force: bool) -> Option<String> {
+        let due = force && !self.text.is_empty()
+            || should_flush_delta(self.text.len(), self.text_flushed_at.elapsed());
+        if !due {
+            return None;
+        }
+        self.text_flushed_at = std::time::Instant::now();
+        Some(std::mem::take(&mut self.text))
+    }
+
+    fn take_reasoning(&mut self, force: bool) -> Option<String> {
+        let due = force && !self.reasoning.is_empty()
+            || should_flush_delta(self.reasoning.len(), self.reasoning_flushed_at.elapsed());
+        if !due {
+            return None;
+        }
+        self.reasoning_flushed_at = std::time::Instant::now();
+        Some(std::mem::take(&mut self.reasoning))
+    }
+}
 
 /// Flush a pending delta once it is big enough OR has waited long enough.
 /// Evaluated when a chunk arrives, so an empty buffer never flushes.
