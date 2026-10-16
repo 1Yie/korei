@@ -77,6 +77,13 @@ pub struct HookChain {
 
 struct Inner {
     hooks: std::sync::RwLock<Vec<Arc<dyn AgentHook>>>,
+    /// Private hooks of a [`HookChain::layered`] chain — they run before the
+    /// base chain's hooks and are never visible to its other clones.
+    local: Vec<Arc<dyn AgentHook>>,
+    /// The shared chain a layered chain reads through. Its hook list and its
+    /// transition slot are live, so a reload and the de-duplicated transition
+    /// stream both reach the layered chain.
+    base: Option<HookChain>,
     /// Last state any clone of this chain observed. Seeded `Idle` so the
     /// first real transition (→ `ScanningWorkspace`) reports its origin.
     last_state: std::sync::Mutex<AgentState>,
@@ -91,6 +98,8 @@ impl Default for Inner {
     fn default() -> Self {
         Self {
             hooks: std::sync::RwLock::new(Vec::new()),
+            local: Vec::new(),
+            base: None,
             last_state: std::sync::Mutex::new(AgentState::Idle),
             transition_tx: std::sync::Mutex::new(None),
         }
@@ -108,6 +117,22 @@ impl Default for HookChain {
 impl HookChain {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A chain that runs `local` first, then whatever `base` holds at call
+    /// time. Each hook keeps its own [`HOOK_TIMEOUT`] — wrapping `base` in a
+    /// single proxy hook would instead give the whole base chain one budget,
+    /// and a timed-out proxy degrades to allow, dropping later vetoes.
+    /// Transitions use `base`'s slot, so the layered engine and the session
+    /// mirroring it still report one transition, not two.
+    pub fn layered(local: Vec<Arc<dyn AgentHook>>, base: &HookChain) -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                local,
+                base: Some(base.clone()),
+                ..Inner::default()
+            }),
+        }
     }
 
     pub fn register(&mut self, hook: Arc<dyn AgentHook>) {
@@ -141,17 +166,28 @@ impl HookChain {
     /// Clone the hook list out of the lock — the lock is never held across an
     /// `await` (a hook is free to be slow; the timeout is what bounds it).
     fn snapshot(&self) -> Vec<Arc<dyn AgentHook>> {
-        self.inner
-            .hooks
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+        let mut hooks = self.inner.local.clone();
+        if let Some(base) = &self.inner.base {
+            hooks.extend(base.snapshot());
+        }
+        hooks.extend(
+            self.inner
+                .hooks
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
+        hooks
     }
 
     /// Record `new` as the current state; returns the state it replaced, or
     /// `None` when nothing changed. Clones share one slot, so a state
     /// announced twice (engine + session) reports once.
     fn take_transition(&self, new: &AgentState) -> Option<AgentState> {
+        if let Some(base) = &self.inner.base {
+            return base.take_transition(new);
+        }
         let mut last = self
             .inner
             .last_state
@@ -383,5 +419,65 @@ mod tests {
         chain.replace(vec![Arc::new(Veto(""))]);
         let err = chain.run_before_tool(&mut call).await.unwrap_err();
         assert!(err.contains("veto"), "{err}");
+    }
+
+    /// A layered chain runs its private hooks first, reads the shared chain
+    /// live, and times every hook separately: hooks that are slow together
+    /// but fast alone cannot push a later veto past one shared budget.
+    #[tokio::test]
+    async fn layered_chains_time_each_hook_and_follow_reloads() {
+        struct Slow;
+        #[async_trait]
+        impl AgentHook for Slow {
+            fn id(&self) -> &str {
+                "slow"
+            }
+            async fn before_tool_execute(&self, _c: &mut ToolCall) -> anyhow::Result<()> {
+                // Two of these exceed one HOOK_TIMEOUT; each alone does not.
+                tokio::time::sleep(HOOK_TIMEOUT / 2 + Duration::from_millis(100)).await;
+                Ok(())
+            }
+        }
+        struct Seen(&'static str, Arc<std::sync::Mutex<Vec<&'static str>>>);
+        #[async_trait]
+        impl AgentHook for Seen {
+            fn id(&self) -> &str {
+                self.0
+            }
+            async fn before_tool_execute(&self, _c: &mut ToolCall) -> anyhow::Result<()> {
+                self.1.lock().unwrap().push(self.0);
+                if self.0 == "veto" {
+                    anyhow::bail!("denied");
+                }
+                Ok(())
+            }
+        }
+
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shared = HookChain::new();
+        let layered = HookChain::layered(vec![Arc::new(Seen("local", order.clone()))], &shared);
+        let mut call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        };
+        assert!(layered.run_before_tool(&mut call).await.is_ok());
+
+        // A reload of the shared chain reaches the layered one.
+        shared.replace(vec![
+            Arc::new(Slow),
+            Arc::new(Slow),
+            Arc::new(Seen("veto", order.clone())),
+        ]);
+        assert_eq!(layered.ids(), vec!["local", "slow", "slow", "veto"]);
+        assert_eq!(
+            layered.run_before_tool(&mut call).await.unwrap_err(),
+            "denied"
+        );
+        assert_eq!(*order.lock().unwrap(), vec!["local", "local", "veto"]);
+
+        // Both chains share one transition timeline.
+        layered.observe(&AgentState::Reasoning).await;
+        assert_eq!(shared.take_transition(&AgentState::Reasoning), None);
     }
 }
