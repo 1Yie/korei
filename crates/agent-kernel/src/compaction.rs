@@ -92,6 +92,20 @@ pub fn should_compact(tokens: usize, window: usize) -> bool {
 /// before/after pair that shows what the last action changed.
 pub const KEEP_TOOL_IMAGES: usize = 2;
 
+/// Stale frames accumulate up to this count before a prune pass runs. Each
+/// pass rewrites older tool rows in the middle of the history, which moves
+/// the provider's prompt-cache prefix back to the first stripped row — so
+/// pruning in batches (down to [`KEEP_TOOL_IMAGES`]) pays that miss once per
+/// several actions instead of on every screenshot.
+pub const PRUNE_TOOL_IMAGES_AT: usize = 6;
+
+/// Budget-fit hysteresis: once the history is over budget, trim down to this
+/// fraction of it rather than just under it. Trimming to the edge drops the
+/// oldest message again on nearly every following round, and each drop
+/// changes the head of the conversation — a full prompt-cache miss per
+/// round. Shedding a margin at once keeps the next rounds' prefix stable.
+pub const FIT_TARGET: f32 = 0.75;
+
 /// Drop the image off every tool result except the newest `keep` frames,
 /// leaving a one-line note so the text still says why the picture is gone.
 /// Only `Role::Tool` rows are touched — images the user attached stay.
@@ -118,7 +132,8 @@ pub fn prune_stale_tool_images(history: &mut [ChatMessage], keep: usize) {
 /// calls — flattening orphans every `Role::Tool` result (P1-b). Reasoning traces
 /// are left alone: display-only, and a reopened session replays them. Image refs
 /// survive only when the model declares image input, the marker text otherwise.
-/// Oldest non-system messages are dropped until the estimate fits `budget_tokens`.
+/// Over `budget_tokens`, oldest non-system messages are dropped until the
+/// estimate fits [`FIT_TARGET`] of it; stale tool frames are pruned in batches.
 pub fn sanitize_for_sample(
     history: &mut Vec<ChatMessage>,
     budget_tokens: usize,
@@ -138,11 +153,19 @@ pub fn sanitize_for_sample(
             m.images.clear();
         }
     } else {
-        prune_stale_tool_images(history, KEEP_TOOL_IMAGES);
+        let frames = history
+            .iter()
+            .filter(|m| m.role == Role::Tool && !m.images.is_empty())
+            .count();
+        if frames > PRUNE_TOOL_IMAGES_AT {
+            prune_stale_tool_images(history, KEEP_TOOL_IMAGES);
+        }
     }
 
-    // (4) fit to budget — drop oldest non-system messages.
-    fit_conversation_to_budget(history, budget_tokens);
+    // (4) fit to budget — drop oldest non-system messages, with headroom.
+    if estimate_tokens(history) > budget_tokens {
+        fit_conversation_to_budget(history, (budget_tokens as f32 * FIT_TARGET) as usize);
+    }
 }
 
 /// Flatten `tool_calls` → `[call: name(args)]` text — the wire shape for
@@ -747,7 +770,7 @@ mod tests {
     #[test]
     fn sanitize_applies_the_frame_bound_for_vision_models() {
         let mut h = vec![msg(Role::System, "sys")];
-        for i in 0..6 {
+        for i in 0..=PRUNE_TOOL_IMAGES_AT {
             h.push(frame_row(&format!("c{i}")));
         }
         sanitize_for_sample(&mut h, 1_000_000, true);
@@ -755,5 +778,38 @@ mod tests {
             h.iter().filter(|m| !m.images.is_empty()).count(),
             KEEP_TOOL_IMAGES
         );
+    }
+
+    /// Frames below the batch threshold stay put: rewriting an older row
+    /// every round would miss the prompt cache from that row onwards.
+    #[test]
+    fn sanitize_prunes_frames_in_batches() {
+        let mut h = vec![msg(Role::System, "sys")];
+        for i in 0..PRUNE_TOOL_IMAGES_AT {
+            h.push(frame_row(&format!("c{i}")));
+        }
+        let before = h.clone();
+        sanitize_for_sample(&mut h, 1_000_000, true);
+        assert_eq!(h, before, "under the threshold nothing is rewritten");
+    }
+
+    /// Over budget, the fit sheds down to `FIT_TARGET` so the following
+    /// rounds (each adding a little) don't drop the head again one by one.
+    #[test]
+    fn fit_trims_with_headroom_and_then_holds_steady() {
+        let mut h = vec![msg(Role::System, "sys")];
+        for i in 0..20 {
+            h.push(msg(Role::User, &format!("{i} {}", "u".repeat(396))));
+        }
+        let budget = estimate_tokens(&h) - 1;
+        sanitize_for_sample(&mut h, budget, true);
+        assert!(estimate_tokens(&h) <= (budget as f32 * FIT_TARGET) as usize);
+        let head = h[1].clone();
+        // A few more rounds of growth stay under budget → head untouched.
+        for i in 0..3 {
+            h.push(msg(Role::User, &format!("more {i}")));
+            sanitize_for_sample(&mut h, budget, true);
+            assert_eq!(h[1], head, "round {i} dropped the head again");
+        }
     }
 }
