@@ -95,15 +95,21 @@ pub enum NoticeKind {
     /// string (`"plan"`), so earlier snapshots read back unchanged. Adapters
     /// drop it from the wire like [`NoticeKind::Compacted`].
     Card(String),
+    /// A mid-turn user steer (`ChatMessage::user_steer`). The model sees an
+    /// ordinary user message; the tag lets replay and counters tell it from
+    /// the prompt that opened the turn, which it belongs to. Unlike `Hidden`
+    /// it is drawn — as a user bubble inside the running turn.
+    Steer,
 }
 
 impl NoticeKind {
-    const NAMES: [(&'static str, NoticeKind); 5] = [
+    const NAMES: [(&'static str, NoticeKind); 6] = [
         ("system", NoticeKind::System),
         ("error", NoticeKind::Error),
         ("hidden", NoticeKind::Hidden),
         ("compacted_memory", NoticeKind::CompactedMemory),
         ("compacted", NoticeKind::Compacted),
+        ("steer", NoticeKind::Steer),
     ];
 
     /// Render metadata only — never context for the model.
@@ -342,6 +348,55 @@ impl ChatMessage {
             duration_ms: None,
         }
     }
+    /// Text the model sees in front of a mid-turn steer. Part of the prompt,
+    /// so it is also how a row persisted before [`NoticeKind::Steer`] existed
+    /// is recognised ([`ChatMessage::is_steer`]).
+    pub const STEER_PREFIX: &'static str = "The user interrupted: ";
+
+    /// A `Role::User` correction injected while a turn is running. The model
+    /// reads `The user interrupted: <text>`; replay and turn counters read
+    /// the [`NoticeKind::Steer`] tag.
+    pub fn user_steer(text: impl AsRef<str>) -> Self {
+        Self {
+            role: Role::User,
+            content: Some(format!("{}{}", Self::STEER_PREFIX, text.as_ref())),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            notice: Some(NoticeKind::Steer),
+            ts: Some(now_ms()),
+            images: Vec::new(),
+            reasoning: None,
+            duration_ms: None,
+        }
+    }
+
+    /// Whether this row is a mid-turn steer. Rows written before the tag
+    /// existed carry no `notice`, only the prefix, so an untagged user row is
+    /// matched on it; a tagged row (`Hidden`, a card, …) never is — a hidden
+    /// instruction that happens to start with the prefix stays hidden.
+    pub fn is_steer(&self) -> bool {
+        self.role == Role::User
+            && match &self.notice {
+                Some(NoticeKind::Steer) => true,
+                None => self
+                    .content
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with(Self::STEER_PREFIX)),
+                Some(_) => false,
+            }
+    }
+
+    /// The steer's own words, without the prefix the model reads. `None` for
+    /// a row that is not a steer.
+    pub fn steer_text(&self) -> Option<&str> {
+        if !self.is_steer() {
+            return None;
+        }
+        let content = self.content.as_deref()?;
+        Some(content.strip_prefix(Self::STEER_PREFIX).unwrap_or(content))
+    }
+
     /// The compaction memory note — kept as `Role::System` so replay
     /// stays hidden, but tagged so adapters route it to user privilege
     /// instead of folding it into `system`/`instructions`.
@@ -940,6 +995,45 @@ mod tests {
             assert_eq!(j, format!("\"{name}\""));
             assert_eq!(serde_json::from_str::<NoticeKind>(&j).unwrap(), kind);
         }
+    }
+
+    /// A steer is tagged on disk, still reads as the user's words to the
+    /// model, and an old row (no tag, prefix only) is still recognised.
+    #[test]
+    fn steers_are_tagged_and_old_untagged_rows_still_match() {
+        let m = ChatMessage::user_steer("先别改 config");
+        assert_eq!(m.notice, Some(NoticeKind::Steer));
+        assert_eq!(m.role, Role::User);
+        assert_eq!(
+            m.content.as_deref(),
+            Some("The user interrupted: 先别改 config")
+        );
+        assert!(m.is_steer());
+        assert_eq!(m.steer_text(), Some("先别改 config"));
+        assert!(!m.notice.as_ref().unwrap().is_ui_only());
+
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains("\"notice\":\"steer\""), "{j}");
+        let back: ChatMessage = serde_json::from_str(&j).unwrap();
+        assert!(back.is_steer());
+
+        let old = r#"{"role":"user","content":"The user interrupted: use the other file"}"#;
+        let back: ChatMessage = serde_json::from_str(old).unwrap();
+        assert_eq!(back.notice, None);
+        assert!(back.is_steer());
+        assert_eq!(back.steer_text(), Some("use the other file"));
+    }
+
+    /// Only a user row can be a steer, and a tagged row is judged by its tag:
+    /// a hidden instruction or a card that quotes the prefix is not one.
+    #[test]
+    fn only_untagged_or_steer_user_rows_are_steers() {
+        assert!(!ChatMessage::user("do the thing").is_steer());
+        assert!(!ChatMessage::user("The user interrupted:no space").is_steer());
+        assert!(!ChatMessage::assistant("The user interrupted: x").is_steer());
+        assert!(!ChatMessage::user_hidden("The user interrupted: x").is_steer());
+        assert!(!ChatMessage::card("plan", "The user interrupted: x".into()).is_steer());
+        assert_eq!(ChatMessage::user("hi").steer_text(), None);
     }
 
     #[test]
