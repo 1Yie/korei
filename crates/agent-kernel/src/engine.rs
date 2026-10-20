@@ -618,13 +618,14 @@ impl Engine {
                 self.steers_this_turn.push(steer.clone());
                 // Echo the steer as a user bubble — the live stream never
                 // showed it otherwise (the composer doesn't echo), while a
-                // reloaded view rebuilt it from history. One render path.
-                let _ = io.ui_tx.send(UiEvent::UserPrompt(steer.clone()));
+                // reloaded view rebuilt it from history. Its own event, not
+                // `UserPrompt`: a steer joins the running turn.
+                let _ = io.ui_tx.send(UiEvent::UserSteer(steer.clone()));
                 // Steering can carry `<attached-image>` markers too — same
                 // extraction as the turn-start path; a text-only model
                 // just keeps the path reference (no mid-turn notice spam).
                 let steer_images = extract_attached_images(&steer);
-                let mut steer_msg = ChatMessage::user(format!("The user interrupted: {steer}"));
+                let mut steer_msg = ChatMessage::user_steer(&steer);
                 if !steer_images.is_empty() && self.supports_images() {
                     steer_msg = steer_msg.with_images(steer_images);
                 }

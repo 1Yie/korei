@@ -98,6 +98,11 @@ pub enum UiEvent {
     StateChanged(AgentState),
     /// The user prompt echoed back — the stream renders it as a user block.
     UserPrompt(String),
+    /// A mid-turn steer echoed back. Drawn as a user bubble like
+    /// [`UiEvent::UserPrompt`], but it belongs to the turn already running and
+    /// never opens one. Carries the steer's own words, without the prefix the
+    /// model reads.
+    UserSteer(String),
     /// A token delta (already throttled by the bridge — NOT per SSE chunk).
     /// `parent` is set on a delegated child's deltas so the UI nests them under
     /// that child's capsule instead of mixing them into the turn's draft.
