@@ -55,6 +55,15 @@ pub trait TurnView: Send + Sync {
     fn mode(&self) -> String;
     /// Whether this turn ran at least one tool call.
     fn did_tool_work(&self) -> bool;
+    /// Whether host notices opened this turn instead of a user prompt.
+    ///
+    /// A wake-up carries no user intent: the model is being told a
+    /// background job ended. A policy must not treat it as work in progress
+    /// — nudging it to press on with a goal, or to submit a plan, would let
+    /// an unattended session keep spending on a chain nobody asked for.
+    fn is_notice_turn(&self) -> bool {
+        false
+    }
 }
 
 /// Product rules applied to a turn that went quiet.

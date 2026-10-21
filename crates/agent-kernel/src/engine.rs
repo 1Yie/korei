@@ -115,6 +115,8 @@ struct EngineTurnView {
     mode: Arc<std::sync::RwLock<String>>,
     /// Tool calls run so far this turn (the loop's `tool_calls_run`).
     tool_calls_run: usize,
+    /// Opened by host notices, not a user prompt — see `TurnView::is_notice_turn`.
+    notice_turn: bool,
 }
 
 impl crate::turn_policy::TurnView for EngineTurnView {
@@ -123,6 +125,9 @@ impl crate::turn_policy::TurnView for EngineTurnView {
     }
     fn did_tool_work(&self) -> bool {
         self.tool_calls_run > 0
+    }
+    fn is_notice_turn(&self) -> bool {
+        self.notice_turn
     }
 }
 
@@ -616,7 +621,7 @@ impl Engine {
         self.steers_this_turn.clear();
         self.denials_this_turn.clear();
         self.push_user_message(io, history, user_text, images);
-        self.run_rounds(io, history).await
+        self.run_rounds(io, history, false).await
     }
 
     /// Wake the model on host notices while no user turn is running — a
@@ -637,7 +642,9 @@ impl Engine {
             history.push(ChatMessage::host_notice(text));
         }
         self.drain_notices(io, history);
-        self.run_rounds(io, history).await
+        // A notice turn tells the policy so: contracts that push work (a
+        // goal to advance, a plan to submit) must not fire on a wake-up.
+        self.run_rounds(io, history, true).await
     }
 
     fn push_user_message(
@@ -669,6 +676,7 @@ impl Engine {
         &mut self,
         io: &mut EngineIo,
         history: &mut Vec<ChatMessage>,
+        notice_turn: bool,
     ) -> Result<TurnOutcome, String> {
         self.set_state(io, AgentState::Reasoning);
 
@@ -1061,6 +1069,7 @@ impl Engine {
                 let view = EngineTurnView {
                     mode: self.agent_mode.clone(),
                     tool_calls_run,
+                    notice_turn,
                 };
                 let verdict = self.policy.on_quiet_round(&view).await;
                 let (before_final, after_final) = match verdict {
