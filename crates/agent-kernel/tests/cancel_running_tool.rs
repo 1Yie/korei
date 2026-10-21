@@ -140,3 +140,112 @@ async fn cancel_stops_a_running_tool() {
     }
     assert_eq!(finished, vec![("slow".to_string(), false)], "{finished:?}");
 }
+
+/// A tool that raises the cancel flag itself and returns — the user hitting
+/// Cancel just as the first of two calls completes.
+fn cancelling_tool(flag: Arc<AtomicBool>) -> ToolSpec {
+    ToolSpec {
+        name: "first",
+        schema: serde_json::json!({ "type": "object", "properties": {} }),
+        readonly: true,
+        class: ToolClass::Observation,
+        network: false,
+        staged: false,
+        review: None,
+        exec: Arc::new(move |_args, _ctx| {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, Ordering::Relaxed);
+                Ok(ToolResult::text("done"))
+            }
+            .boxed()
+        }),
+    }
+}
+
+/// Cancel between two calls: the second never starts, so the UI must not get
+/// a `ToolCallFinished` for it — there is no card to settle, and a stray one
+/// draws a failed call that never ran. History still answers both calls.
+#[tokio::test]
+async fn cancel_before_dispatch_draws_no_card() {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let mut registry = ToolRegistry::new();
+    registry.register(cancelling_tool(cancel.clone()));
+    registry.register(slow_tool(dropped.clone()));
+
+    let provider = Arc::new(ScriptedProvider::new().with_script(vec![
+        StreamChunk::ToolCallDelta {
+            slot: 0,
+            id: Some("c1".into()),
+            name: Some("first".into()),
+            args_delta: "{}".into(),
+        },
+        StreamChunk::ToolCallDelta {
+            slot: 1,
+            id: Some("c2".into()),
+            name: Some("slow".into()),
+            args_delta: "{}".into(),
+        },
+        StreamChunk::Done {
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_tokens: None,
+        },
+    ]));
+    provider.script_text("carried on");
+
+    let mut engine = Engine::new(
+        provider.clone(),
+        Arc::new(registry),
+        Arc::new(ToolCtx::new()),
+        "scripted",
+        0.0,
+    );
+    engine.set_permissions(PermissionGate::from_mode_str("bypassPermissions"));
+
+    let (ui_tx, mut ui_rx) = UiSink::channel();
+    let (_steer_tx, steer_rx) = tokio::sync::mpsc::channel(4);
+    let (_notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
+    let mut io = EngineIo {
+        ui_tx,
+        steer_rx,
+        notice_rx,
+        cancel: cancel.clone(),
+    };
+    let mut history: Vec<ChatMessage> = Vec::new();
+
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine.run_turn(&mut io, &mut history, "two calls".into()),
+    )
+    .await
+    .expect("the turn ends on the cancel")
+    .expect_err("a cancelled turn is an error");
+    assert_eq!(err, "turn cancelled by user");
+    assert!(
+        !dropped.load(Ordering::Relaxed),
+        "the second call never ran"
+    );
+
+    let (mut started, mut finished) = (Vec::new(), Vec::new());
+    while let Some(ev) = ui_rx.try_recv() {
+        match ev {
+            agent_ipc::UiEvent::ToolCallStarted { name, .. } => started.push(name),
+            agent_ipc::UiEvent::ToolCallFinished { name, ok, .. } => finished.push((name, ok)),
+            _ => {}
+        }
+    }
+    assert_eq!(started, vec!["first".to_string()], "{started:?}");
+    assert_eq!(finished, vec![("first".to_string(), true)], "{finished:?}");
+
+    let answered: Vec<_> = history
+        .iter()
+        .filter_map(|m| m.tool_call_id.as_deref().zip(m.content.as_deref()))
+        .collect();
+    assert_eq!(
+        answered,
+        vec![("c1", "done"), ("c2", "cancelled before dispatch")],
+        "{history:#?}"
+    );
+}

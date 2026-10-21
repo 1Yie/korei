@@ -1139,15 +1139,17 @@ impl Engine {
                 // P0-C4: cancel between tool dispatches — a destructive tool
                 // must not fire after the user already hit Cancel.
                 if io.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Its card is already on screen — settle it as failed
-                    // rather than leave a spinner behind.
+                    // This call's card has not been drawn yet —
+                    // `ToolCallStarted` comes further down — so there is no
+                    // spinner to settle. A `ToolCallFinished` here would
+                    // invent a failed card for a call that never showed.
                     return self.abort_cancelled(
                         io,
                         history,
                         &calls,
                         call_idx,
                         "cancelled before dispatch",
-                        Some(call.name.clone()),
+                        None,
                     );
                 }
                 // Skip degenerate calls — a text-protocol echo can produce an
@@ -1651,7 +1653,8 @@ impl Engine {
     /// carrying `tool_calls` with unanswered results orphans the next request
     /// (strict providers reject it) and makes a reloaded view silently drop
     /// chips the live view had. `running` names the call whose dispatch was
-    /// interrupted, so its card settles instead of spinning forever.
+    /// interrupted, so its card settles instead of spinning forever — `None`
+    /// when the cancel landed before that call's `ToolCallStarted`.
     fn abort_cancelled(
         &mut self,
         io: &mut EngineIo,
