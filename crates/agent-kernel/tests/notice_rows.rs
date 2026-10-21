@@ -1,10 +1,10 @@
-//! A host notice is a system row, never a steer.
+//! A host notice is a tagged host row, never a steer.
 //!
 //! Background completions and other host-side pushes arrive on `notice_rx`.
-//! They must reach the model as system lines: the text can carry untrusted
-//! tool output, so it may never dress itself up as the user's own words, and
-//! the turn's steer count (the memory distiller's correction seed) must stay
-//! clean.
+//! The text can carry untrusted tool output, so it may never dress itself up
+//! as the user's own words (the turn's steer count is the memory distiller's
+//! correction seed) nor as a plain system instruction: it lands tagged
+//! `NoticeKind::Host`, which adapters fence at user privilege.
 
 use std::sync::Arc;
 
@@ -75,7 +75,7 @@ async fn run_with_notice(notice: &str) -> Run {
 }
 
 #[tokio::test]
-async fn a_notice_lands_as_a_system_row() {
+async fn a_notice_lands_as_a_host_row() {
     let run = run_with_notice(NOTICE).await;
 
     let row = run
@@ -84,7 +84,7 @@ async fn a_notice_lands_as_a_system_row() {
         .find(|m| m.content.as_deref() == Some(NOTICE))
         .expect("the notice row");
     assert_eq!(row.role, Role::System, "{row:#?}");
-    assert_eq!(row.notice, Some(NoticeKind::System));
+    assert_eq!(row.notice, Some(NoticeKind::Host));
     assert!(!row.is_steer());
 }
 

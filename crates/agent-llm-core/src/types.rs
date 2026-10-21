@@ -100,16 +100,25 @@ pub enum NoticeKind {
     /// the prompt that opened the turn, which it belongs to. Unlike `Hidden`
     /// it is drawn — as a user bubble inside the running turn.
     Steer,
+    /// A host-pushed notice (`ChatMessage::host_notice`) — a background job
+    /// finishing, a watch firing. Like [`NoticeKind::CompactedMemory`] it is
+    /// `Role::System` internally (never a user turn, never a steer) but
+    /// adapters MUST NOT fold it into `system`/`instructions`: the text can
+    /// carry untrusted tool output, so it is emitted at user privilege,
+    /// fenced as a host notice. The UI shows the event behind it through
+    /// its own channel, so replay does not draw the row.
+    Host,
 }
 
 impl NoticeKind {
-    const NAMES: [(&'static str, NoticeKind); 6] = [
+    const NAMES: [(&'static str, NoticeKind); 7] = [
         ("system", NoticeKind::System),
         ("error", NoticeKind::Error),
         ("hidden", NoticeKind::Hidden),
         ("compacted_memory", NoticeKind::CompactedMemory),
         ("compacted", NoticeKind::Compacted),
         ("steer", NoticeKind::Steer),
+        ("host", NoticeKind::Host),
     ];
 
     /// Render metadata only — never context for the model.
@@ -314,6 +323,14 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+        }
+    }
+    /// A host-pushed notice — see [`NoticeKind::Host`]. Model-facing: the
+    /// text may end in a log tail meant for the model only.
+    pub fn host_notice(text: impl Into<String>) -> Self {
+        Self {
+            notice: Some(NoticeKind::Host),
+            ..Self::notice(text)
         }
     }
     /// Same, for a `UiEvent::Error` line — replays with the `⚠` prefix.
@@ -974,6 +991,13 @@ mod tests {
         let j = serde_json::to_string(&m).unwrap();
         let back: ChatMessage = serde_json::from_str(&j).unwrap();
         assert_eq!(back.notice, Some(NoticeKind::Error));
+        let m = ChatMessage::host_notice("[background task bg-1 finished]");
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains("\"notice\":\"host\""), "{j}");
+        let back: ChatMessage = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.role, Role::System);
+        assert_eq!(back.notice, Some(NoticeKind::Host));
+        assert!(!back.notice.unwrap().is_ui_only());
         let old = r#"{"role":"system","content":"a context note"}"#;
         let back: ChatMessage = serde_json::from_str(old).unwrap();
         assert_eq!(back.notice, None);

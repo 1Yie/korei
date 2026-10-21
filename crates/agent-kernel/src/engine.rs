@@ -520,12 +520,14 @@ impl Engine {
             .any(|i| i.eq_ignore_ascii_case("image"))
     }
 
-    /// Drain host-pushed notices into history as system rows. A notice is not
-    /// a steer: it carries no user intent, so it is styled as a system line
-    /// (never a user bubble) and never reaches `steers_this_turn`.
+    /// Drain host-pushed notices into history as `NoticeKind::Host` rows. A
+    /// notice is not a steer: it carries no user intent, so it never draws a
+    /// user bubble and never reaches `steers_this_turn`; nor is it a system
+    /// instruction — adapters fence it at user privilege, because its text
+    /// can carry untrusted tool output.
     fn drain_notices(&mut self, io: &mut EngineIo, history: &mut Vec<ChatMessage>) {
         while let Ok(text) = io.notice_rx.try_recv() {
-            history.push(ChatMessage::notice(text));
+            history.push(ChatMessage::host_notice(text));
         }
     }
 
