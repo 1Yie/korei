@@ -193,6 +193,7 @@ async fn a_second_agent_runs_a_turn_with_its_own_tools() {
     let mut io = EngineIo {
         ui_tx,
         steer_rx,
+        notice_rx: tokio::sync::mpsc::channel(4).1,
         cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let mut history: Vec<ChatMessage> = Vec::new();

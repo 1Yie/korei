@@ -55,6 +55,7 @@ async fn text_before_a_stall_reaches_the_ui_without_a_cancel() {
     let mut io = EngineIo {
         ui_tx,
         steer_rx,
+        notice_rx: tokio::sync::mpsc::channel(4).1,
         cancel: cancel.clone(),
     };
     let mut history: Vec<ChatMessage> = Vec::new();
@@ -150,6 +151,7 @@ async fn idle_flush_keeps_the_text_exact_and_ordered() {
     let mut io = EngineIo {
         ui_tx,
         steer_rx,
+        notice_rx: tokio::sync::mpsc::channel(4).1,
         cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     let mut history: Vec<ChatMessage> = Vec::new();

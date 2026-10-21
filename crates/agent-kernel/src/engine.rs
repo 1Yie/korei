@@ -28,6 +28,10 @@ pub struct EngineIo {
     /// Mid-turn steering texts — the host forwards its steer command
     /// into this channel; the engine drains it between tool calls.
     pub steer_rx: mpsc::Receiver<String>,
+    /// Host-pushed notices (a background job finishing, a watch firing).
+    /// Unlike `steer_rx` this carries no user intent: the engine appends each
+    /// text as a system row, never as a user message and never as a steer.
+    pub notice_rx: mpsc::Receiver<String>,
     /// Cooperative cancel flag — the UI/actor sets it (bypassing the command
     /// pump so it lands mid-turn); the engine checks it between chunks and
     /// before each tool dispatch. `Arc` shared with `SessionActor::cancel`.
@@ -516,6 +520,15 @@ impl Engine {
             .any(|i| i.eq_ignore_ascii_case("image"))
     }
 
+    /// Drain host-pushed notices into history as system rows. A notice is not
+    /// a steer: it carries no user intent, so it is styled as a system line
+    /// (never a user bubble) and never reaches `steers_this_turn`.
+    fn drain_notices(&mut self, io: &mut EngineIo, history: &mut Vec<ChatMessage>) {
+        while let Ok(text) = io.notice_rx.try_recv() {
+            history.push(ChatMessage::notice(text));
+        }
+    }
+
     /// Drain any pending steering texts between tool calls — marks the
     /// turn `steered` for UI provenance.
     fn drain_steering(&mut self, io: &mut EngineIo, history: &mut Vec<ChatMessage>) {
@@ -612,6 +625,7 @@ impl Engine {
                 return Err(CANCEL_ERR.into());
             }
 
+            self.drain_notices(io, history);
             self.drain_steering(io, history);
             while let Some(steer) = self.steer_queue.pop_front() {
                 // Provenance: this steer is being injected into THIS turn.

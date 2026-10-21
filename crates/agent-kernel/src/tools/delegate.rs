@@ -583,6 +583,7 @@ impl SubagentSpawner {
         let mut io = EngineIo {
             ui_tx,
             steer_rx,
+            notice_rx: tokio::sync::mpsc::channel(4).1,
             cancel,
         };
         // The contract is always present; a custom manifest body is appended to
