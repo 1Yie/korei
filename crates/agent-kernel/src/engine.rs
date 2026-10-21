@@ -40,6 +40,42 @@ pub struct EngineIo {
     pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Cancel sentinel — the `Err` value and `Failed` reason (never rendered
+/// verbatim; the status bar localizes `Failed`). The user-facing line is
+/// `CANCEL_TEXT`.
+const CANCEL_ERR: &str = "turn cancelled by user";
+
+/// The single system line shown for a cancelled turn.
+const CANCEL_TEXT: &str = "已被用户中断";
+
+/// How often a running tool's cancel flag is polled. A blocking `bash` has to
+/// stop within a fraction of a second of the user hitting Cancel, not at its
+/// own timeout.
+const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Await `fut`, giving up as soon as the user cancels.
+///
+/// Dropping the future IS the kill: every sandbox backend spawns its child
+/// with `kill_on_drop`, and bwrap runs with `--unshare-pid --die-with-parent`,
+/// so a long build dies with the dropped future instead of running on after
+/// the turn was abandoned.
+async fn until_cancelled<F: std::future::Future>(
+    cancel: &std::sync::atomic::AtomicBool,
+    fut: F,
+) -> Option<F::Output> {
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            _ = tokio::time::sleep(CANCEL_POLL) => {
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// Per-turn outcome handed back to `SessionActor`.
 #[derive(Debug)]
 pub struct TurnOutcome {
@@ -651,12 +687,6 @@ impl Engine {
         // short-circuit this one (the contracts are per-turn: each goal
         // prompt ends declared).
         self.policy.begin_turn();
-        /// Cancel sentinel — the `Err` value and `Failed` reason (never
-        /// rendered verbatim; the status bar localizes `Failed`). The
-        /// user-facing line is `CANCEL_TEXT`.
-        const CANCEL_ERR: &str = "turn cancelled by user";
-        /// The single system line shown for a cancelled turn.
-        const CANCEL_TEXT: &str = "已被用户中断";
 
         loop {
             // P0-C4: cooperative cancel — checked at the top of every
@@ -1109,20 +1139,14 @@ impl Engine {
                 // P0-C4: cancel between tool dispatches — a destructive tool
                 // must not fire after the user already hit Cancel.
                 if io.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Fill the undispatched calls — an assistant row with
-                    // tool_calls but missing tool results orphans the next
-                    // request (strict providers reject it) and makes the
-                    // reloaded view silently drop chips the live view had.
-                    for pending_call in calls.iter().skip(call_idx) {
-                        history.push(ChatMessage::tool_result_err(
-                            pending_call.id.clone(),
-                            "cancelled before dispatch",
-                        ));
-                    }
-                    history.push(ChatMessage::notice(CANCEL_TEXT));
-                    self.set_state(io, AgentState::Failed(CANCEL_ERR.into()));
-                    let _ = io.ui_tx.send(UiEvent::SystemMessage(CANCEL_TEXT.into()));
-                    return Err(CANCEL_ERR.into());
+                    return self.abort_cancelled(
+                        io,
+                        history,
+                        &calls,
+                        call_idx,
+                        "cancelled before dispatch",
+                        None,
+                    );
                 }
                 // Skip degenerate calls — a text-protocol echo can produce an
                 // empty-name or empty-args call that must never dispatch
@@ -1464,53 +1488,85 @@ impl Engine {
                 // covers dispatch + deferred-write commits + after_tool
                 // hooks, i.e. everything the row's `· 3s` label meant live.
                 let call_started = std::time::Instant::now();
-                let (mut content, ui_type, mut ok, commit, result_images) =
-                    if let Some(res) = staged {
-                        let ui_type = res.ui_type.map(|s| s.to_string());
-                        (res.content, ui_type, true, res.commit, res.images)
-                    } else {
-                        match self
-                            .active_registry()
-                            .dispatch(&call.name, args.clone(), self.ctx.clone())
-                            .await
-                        {
-                            Ok(res) => (
-                                res.content,
-                                res.ui_type.map(|s| s.to_string()),
-                                true,
-                                res.commit,
-                                res.images,
-                            ),
-                            Err(e) => {
-                                // Built-in miss → try the plugin router (built-in
-                                // names are reserved and can't be shadowed).
-                                // External tools use the same result contract.
-                                // Plan mode dispatches read-only built-ins only.
-                                if !self.plugins_allowed() {
-                                    (e.to_string(), None, false, None, Vec::new())
-                                } else if let Some(mgr) = self.plugins() {
-                                    // Report the plugin's own failure. Its message names the
-                                    // real cause (server error, dead bridge); the built-in
-                                    // "unknown tool" text would send the model hunting for a
-                                    // tool that exists.
-                                    match mgr.dispatch_tool_call(&call.name, args).await {
-                                        Some(Ok(out)) => (
-                                            out.content,
-                                            out.ui_type.map(|s| s.to_string()),
-                                            true,
-                                            out.commit,
-                                            out.images,
-                                        ),
-                                        // An unowned name preserves the registry's real error.
-                                        None => (e.to_string(), None, false, None, Vec::new()),
-                                        Some(Err(msg)) => (msg, None, false, None, Vec::new()),
-                                    }
-                                } else {
-                                    (e.to_string(), None, false, None, Vec::new())
+                let (mut content, ui_type, mut ok, commit, result_images) = if let Some(res) =
+                    staged
+                {
+                    let ui_type = res.ui_type.map(|s| s.to_string());
+                    (res.content, ui_type, true, res.commit, res.images)
+                } else {
+                    // A `bash` (or the test suite under it) can run for
+                    // minutes. Race it against the flag so Cancel lands
+                    // now, not after the tool's own timeout.
+                    let Some(dispatched) = until_cancelled(
+                        &io.cancel,
+                        self.active_registry()
+                            .dispatch(&call.name, args.clone(), self.ctx.clone()),
+                    )
+                    .await
+                    else {
+                        return self.abort_cancelled(
+                            io,
+                            history,
+                            &calls,
+                            call_idx,
+                            "cancelled while running",
+                            Some(call.name.clone()),
+                        );
+                    };
+                    match dispatched {
+                        Ok(res) => (
+                            res.content,
+                            res.ui_type.map(|s| s.to_string()),
+                            true,
+                            res.commit,
+                            res.images,
+                        ),
+                        Err(e) => {
+                            // Built-in miss → try the plugin router (built-in
+                            // names are reserved and can't be shadowed).
+                            // External tools use the same result contract.
+                            // Plan mode dispatches read-only built-ins only.
+                            if !self.plugins_allowed() {
+                                (e.to_string(), None, false, None, Vec::new())
+                            } else if let Some(mgr) = self.plugins() {
+                                // Report the plugin's own failure. Its message names the
+                                // real cause (server error, dead bridge); the built-in
+                                // "unknown tool" text would send the model hunting for a
+                                // tool that exists. A plugin round-trip is a network
+                                // wait too, so it gets the same cancel race.
+                                let Some(routed) = until_cancelled(
+                                    &io.cancel,
+                                    mgr.dispatch_tool_call(&call.name, args),
+                                )
+                                .await
+                                else {
+                                    return self.abort_cancelled(
+                                        io,
+                                        history,
+                                        &calls,
+                                        call_idx,
+                                        "cancelled while running",
+                                        Some(call.name.clone()),
+                                    );
+                                };
+                                match routed {
+                                    Some(Ok(out)) => (
+                                        out.content,
+                                        out.ui_type.map(|s| s.to_string()),
+                                        true,
+                                        out.commit,
+                                        out.images,
+                                    ),
+                                    // An unowned name preserves the registry's real error.
+                                    None => (e.to_string(), None, false, None, Vec::new()),
+                                    Some(Err(msg)) => (msg, None, false, None, Vec::new()),
                                 }
+                            } else {
+                                (e.to_string(), None, false, None, Vec::new())
                             }
                         }
-                    };
+                    }
+                };
 
                 // P1-c: apply the effect the tool staged — the engine owns it
                 // so it lands only after the permission decision. `verify`
@@ -1585,6 +1641,41 @@ impl Engine {
 
             self.set_state(io, AgentState::Reasoning);
         }
+    }
+
+    /// Abandon the turn because the user cancelled.
+    ///
+    /// Every call from `from` on still gets a tool result — an assistant row
+    /// carrying `tool_calls` with unanswered results orphans the next request
+    /// (strict providers reject it) and makes a reloaded view silently drop
+    /// chips the live view had. `running` names the call whose dispatch was
+    /// interrupted, so its card settles instead of spinning forever.
+    fn abort_cancelled(
+        &mut self,
+        io: &mut EngineIo,
+        history: &mut Vec<ChatMessage>,
+        calls: &[agent_llm_core::types::ToolCall],
+        from: usize,
+        label: &str,
+        running: Option<String>,
+    ) -> Result<TurnOutcome, String> {
+        if let Some(name) = running {
+            let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                name,
+                ok: false,
+                content: CANCEL_TEXT.into(),
+                ui_type: None,
+                parent: None,
+                child_id: None,
+            });
+        }
+        for pending_call in calls.iter().skip(from) {
+            history.push(ChatMessage::tool_result_err(pending_call.id.clone(), label));
+        }
+        history.push(ChatMessage::notice(CANCEL_TEXT));
+        self.set_state(io, AgentState::Failed(CANCEL_ERR.into()));
+        let _ = io.ui_tx.send(UiEvent::SystemMessage(CANCEL_TEXT.into()));
+        Err(CANCEL_ERR.into())
     }
 
     /// Auto-compaction check — the turn-start pass and every mid-turn tool
