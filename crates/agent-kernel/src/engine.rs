@@ -1139,13 +1139,15 @@ impl Engine {
                 // P0-C4: cancel between tool dispatches — a destructive tool
                 // must not fire after the user already hit Cancel.
                 if io.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Its card is already on screen — settle it as failed
+                    // rather than leave a spinner behind.
                     return self.abort_cancelled(
                         io,
                         history,
                         &calls,
                         call_idx,
                         "cancelled before dispatch",
-                        None,
+                        Some(call.name.clone()),
                     );
                 }
                 // Skip degenerate calls — a text-protocol echo can produce an
