@@ -129,6 +129,94 @@ async fn a_notice_never_echoes_as_a_user_row() {
     );
 }
 
+/// A job that finishes while the session is idle wakes the model on its own
+/// turn: the notices open it, the model answers without a user prompt, and
+/// nothing in it counts as a user turn.
+#[tokio::test]
+async fn an_idle_session_wakes_on_a_notice() {
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.script_text("the suite passed");
+    let ctx = Arc::new(ToolCtx::new());
+    let mut engine = Engine::new(
+        provider.clone(),
+        Arc::new(ToolRegistry::new()),
+        ctx,
+        "scripted",
+        0.0,
+    );
+    engine.set_permissions(PermissionGate::from_mode_str("bypassPermissions"));
+
+    let (ui_tx, mut ui_rx) = UiSink::channel();
+    let (_steer_tx, steer_rx) = tokio::sync::mpsc::channel(4);
+    let (notice_tx, notice_rx) = tokio::sync::mpsc::channel(4);
+    // One more notice is already queued: the waking call takes it too.
+    notice_tx
+        .send("[watch] build.log changed".to_string())
+        .await
+        .unwrap();
+    let mut io = EngineIo {
+        ui_tx,
+        steer_rx,
+        notice_rx,
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let mut history: Vec<ChatMessage> = Vec::new();
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        engine.run_notice_turn(&mut io, &mut history, vec![NOTICE.to_string()]),
+    )
+    .await
+    .expect("the notice turn must not park")
+    .expect("the notice turn should finish");
+    assert_eq!(outcome.text, "the suite passed");
+
+    // Both notices are in the transcript, both tagged as host rows.
+    let notices: Vec<&ChatMessage> = history
+        .iter()
+        .filter(|m| m.notice == Some(NoticeKind::Host))
+        .collect();
+    assert_eq!(notices.len(), 2, "{history:#?}");
+    assert!(notices[0]
+        .content
+        .as_deref()
+        .unwrap()
+        .contains("bg-1 finished"));
+    assert!(notices[1].content.as_deref().unwrap().contains("build.log"));
+    // No user turn was invented for the wake-up.
+    assert!(
+        !history
+            .iter()
+            .any(|m| m.role == Role::User && m.notice.is_none()),
+        "{history:#?}"
+    );
+    assert!(outcome.steers.is_empty());
+
+    let seen = provider.seen_messages.lock().unwrap();
+    let shown = seen.last().expect("one request");
+    assert!(
+        shown.iter().any(|m| m.contains("bg-1 finished"))
+            && shown.iter().any(|m| m.contains("build.log changed")),
+        "the model must see both notices: {shown:?}"
+    );
+
+    // The UI draws the answer, not a user bubble.
+    let mut events = Vec::new();
+    while let Some(ev) = ui_rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        !events.iter().any(|e| matches!(e, UiEvent::UserPrompt(_))),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, UiEvent::AssistantMessage(t) if t == "the suite passed")),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn the_model_still_reads_the_notice() {
     let run = run_with_notice(NOTICE).await;

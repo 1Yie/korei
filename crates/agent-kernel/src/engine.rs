@@ -30,7 +30,9 @@ pub struct EngineIo {
     pub steer_rx: mpsc::Receiver<String>,
     /// Host-pushed notices (a background job finishing, a watch firing).
     /// Unlike `steer_rx` this carries no user intent: the engine appends each
-    /// text as a system row, never as a user message and never as a steer.
+    /// text as a host row, never as a user message and never as a steer. A
+    /// running turn drains it between tool calls; an idle host wakes the
+    /// model on it with [`Engine::run_notice_turn`].
     pub notice_rx: mpsc::Receiver<String>,
     /// Cooperative cancel flag — the UI/actor sets it (bypassing the command
     /// pump so it lands mid-turn); the engine checks it between chunks and
@@ -577,6 +579,38 @@ impl Engine {
         // Fresh provenance record for this turn — see `TurnOutcome::steers`.
         self.steers_this_turn.clear();
         self.denials_this_turn.clear();
+        self.push_user_message(io, history, user_text, images);
+        self.run_rounds(io, history).await
+    }
+
+    /// Wake the model on host notices while no user turn is running — a
+    /// background job finished after the last turn ended. The turn opens on
+    /// the notices themselves (`notices` plus whatever else is already
+    /// queued on `notice_rx`); there is no user message, so nothing in it
+    /// reads as the user's words or counts as a user turn.
+    #[instrument(skip_all, name = "notice_turn")]
+    pub async fn run_notice_turn(
+        &mut self,
+        io: &mut EngineIo,
+        history: &mut Vec<ChatMessage>,
+        notices: Vec<String>,
+    ) -> Result<TurnOutcome, String> {
+        self.steers_this_turn.clear();
+        self.denials_this_turn.clear();
+        for text in notices {
+            history.push(ChatMessage::host_notice(text));
+        }
+        self.drain_notices(io, history);
+        self.run_rounds(io, history).await
+    }
+
+    fn push_user_message(
+        &mut self,
+        io: &mut EngineIo,
+        history: &mut Vec<ChatMessage>,
+        user_text: String,
+        images: Vec<agent_llm_core::types::ImageRef>,
+    ) {
         let mut user_msg = ChatMessage::user(user_text);
         if !images.is_empty() {
             if self.supports_images() {
@@ -592,6 +626,14 @@ impl Engine {
             }
         }
         history.push(user_msg);
+    }
+
+    /// The sample → tools → re-sample loop shared by user and notice turns.
+    async fn run_rounds(
+        &mut self,
+        io: &mut EngineIo,
+        history: &mut Vec<ChatMessage>,
+    ) -> Result<TurnOutcome, String> {
         self.set_state(io, AgentState::Reasoning);
 
         // The per-round sanitize + compaction check below own both the
