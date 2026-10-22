@@ -110,6 +110,13 @@ fn card_body(body: &str) -> String {
     out
 }
 
+/// The report the parent reads in place of the child's answer. The id is part of
+/// the header so a report stays traceable to the child that wrote it — and to
+/// the transcript file the host names after the same id.
+fn child_report(id: u64, tool_calls: usize, secs: f32, text: &str) -> String {
+    format!("[subagent report — child_id {id} · {tool_calls} tool calls, {secs:.0}s]\n{text}")
+}
+
 /// One child's card in the parent's stream: opened when the child starts and
 /// closed exactly once over the child's whole lifetime — which now spans
 /// several parent turns, so the card stays open while the child waits.
@@ -994,11 +1001,11 @@ impl ChildRun {
         // text hides how much work the child actually did.
         let report = match engine.run_turn(&mut io, &mut history, task).await {
             Err(e) => Err(format!("{e}")),
-            Ok(outcome) => Ok(format!(
-                "[subagent report — {} tool calls, {:.0}s]\n{}",
+            Ok(outcome) => Ok(child_report(
+                id,
                 outcome.tool_calls_run,
                 start.elapsed().as_secs_f32(),
-                outcome.text
+                &outcome.text,
             )),
         };
         // Kept whatever the outcome: a cancelled or failed child is exactly the
@@ -1535,6 +1542,24 @@ mod tests {
         assert!(
             body.is_char_boundary(body.len() - CHILD_CARD_CUT.len()),
             "the cut never splits a char"
+        );
+    }
+
+    /// The report header names the child it came from: a fan-out hands the
+    /// parent several reports, and an id is the only thing that tells them
+    /// apart — it is also the id the host names the child's transcript after.
+    #[test]
+    fn the_report_header_carries_the_child_id() {
+        let report = child_report(17, 4, 2.4, "done");
+        let (header, body) = report.split_once('\n').expect("header line, then the body");
+        assert!(header.contains("child_id 17"), "{header}");
+        assert!(header.contains("4 tool calls"), "{header}");
+        assert!(header.contains("2s"), "{header}");
+        assert_eq!(body, "done");
+        assert_ne!(
+            child_report(1, 0, 0.0, "x"),
+            child_report(2, 0, 0.0, "x"),
+            "two children's reports must not read the same"
         );
     }
 
