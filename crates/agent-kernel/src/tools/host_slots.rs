@@ -10,6 +10,23 @@
 
 use std::sync::Arc;
 
+/// The user's answer to one approval card.
+#[derive(Debug, Clone, Default)]
+pub struct ToolVerdict {
+    pub approved: bool,
+    /// Which offered [`agent_ipc::events::ApprovalAction`] was picked, if the
+    /// card had any. `None` is a plain 允许.
+    pub action: Option<String>,
+}
+
+/// The host's answer to "may this path be granted?" — `action` is the id the
+/// card offered, `path` the path the tool refused. Installed by a host that
+/// can widen a session's reach (linked workspaces); without it the kernel has
+/// nowhere to send the question, so a refusal stays a plain refusal.
+pub struct ScopeGrantSlot(
+    pub Arc<dyn Fn(&str, &str, &str) -> Result<(), String> + Send + Sync>,
+);
+
 use super::registry::{ToolCtx, ToolError};
 
 /// The structured-question channel — `ask_question` parks a oneshot here,
@@ -145,6 +162,28 @@ impl ToolCtx {
     /// `Arc`, so answers routed through the host reach the parked tool call.
     pub fn install_ask(&mut self, ask: Arc<AskChannel>) {
         self.ext.insert(Arc::new(AskSlot(ask)));
+    }
+
+    /// Install the grant callback. The kernel offers `action` as an approval
+    /// choice, so the ids it passes back are the ones the host put on the card.
+    pub fn install_scope_grant(
+        &mut self,
+        grant: Arc<dyn Fn(&str, &str, &str) -> Result<(), String> + Send + Sync>,
+    ) {
+        self.ext.insert(Arc::new(ScopeGrantSlot(grant)));
+    }
+
+    /// Can the host grant more? Absent → a refusal stays a refusal and no
+    /// approval card is shown for it.
+    pub fn has_scope_grant(&self) -> bool {
+        self.ext.get::<ScopeGrantSlot>().is_some()
+    }
+
+    /// Perform the chosen grant. `None` when no host installed one.
+    /// `access` is `"read"` or `"readwrite"`: a grant for reading a
+    /// dependency is not the same permission as one for editing it.
+    pub fn grant_scope(&self, action: &str, path: &str, access: &str) -> Option<Result<(), String>> {
+        self.ext.get::<ScopeGrantSlot>().map(|s| (s.0)(action, path, access))
     }
 
     /// The session UI event sink, if this context has one. Tools that fan out

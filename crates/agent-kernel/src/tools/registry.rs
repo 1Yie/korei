@@ -356,7 +356,10 @@ mod tests {
             .map(|s| s["function"]["name"].as_str().unwrap())
             .collect();
         names.sort();
-        assert_eq!(names, ["ask_question", "batch_execute", "delegate", "todo"]);
+        assert_eq!(
+            names,
+            ["ask_question", "batch_execute", "delegate", "link_workspace", "todo"]
+        );
     }
 
     #[test]

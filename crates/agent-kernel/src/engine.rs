@@ -190,7 +190,7 @@ pub struct Engine {
     /// `Some((request_id, approved))` here and the engine polls it. The
     /// `request_id` correlates a verdict to its `ApprovalRequested`; stale
     /// ids are ignored instead of approving a different tool (P1-a).
-    decision: Arc<std::sync::Mutex<Option<(u64, bool)>>>,
+    decision: Arc<std::sync::Mutex<Option<(u64, crate::tools::registry::ToolVerdict)>>>,
     /// Monotone id source for `ApprovalRequested` correlation.
     next_request_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Context window for the active model — compaction triggers at
@@ -261,7 +261,7 @@ impl Engine {
             next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             context_window: 256_000,
             compact_at: crate::compaction::COMPACT_AT,
-            max_tool_rounds: 128,
+            max_tool_rounds: usize::MAX,
             model_input: Vec::new(),
             compaction_suppressor: CompactionSuppressor::default(),
             last_prompt_tokens: 0,
@@ -286,8 +286,14 @@ impl Engine {
         &self.model_params
     }
 
-    /// Bound the tool loop per turn — default 128; delegated children
-    /// get a tighter budget so a runaway subagent can't burn the turn.
+    /// Bound the tool loop per turn — unlimited by default.
+    ///
+    /// A count of round-trips is not evidence of a runaway: a legitimate turn
+    /// can need hundreds (a repo-wide refactor, a review that reads forty
+    /// files), and cutting it off mid-work costs more than the loop it was
+    /// meant to catch. What does bound a turn is the context window and the
+    /// user keeping the brake. A caller that pays per call, or that runs
+    /// unattended, sets its own bound here.
     pub fn set_max_tool_rounds(&mut self, rounds: usize) {
         self.max_tool_rounds = rounds;
     }
@@ -508,7 +514,7 @@ impl Engine {
     /// The shared decision slot — SessionActor clones it to deliver
     /// `ToolDecision { request_id, approved }` while the engine is
     /// mid-`run_turn`.
-    pub fn decision_slot(&self) -> Arc<std::sync::Mutex<Option<(u64, bool)>>> {
+    pub fn decision_slot(&self) -> Arc<std::sync::Mutex<Option<(u64, crate::tools::registry::ToolVerdict)>>> {
         self.decision.clone()
     }
 
@@ -687,8 +693,8 @@ impl Engine {
         let mut tool_calls_run = 0usize;
         let mut tool_rounds = 0usize;
         let mut force_no_tools = false;
-        // Runaway-loop bound; delegated children get a smaller budget via
-        // set_max_tool_rounds.
+        // Optional bound — unlimited unless a caller asked for one. Round-trip
+        // count is a poor proxy for a runaway; see `set_max_tool_rounds`.
         let max_tool_rounds = self.max_tool_rounds;
         // A fresh turn starts from a clean policy state — a leftover
         // `goal_complete`/`submit_plan` from an earlier turn must not
@@ -1315,17 +1321,48 @@ impl Engine {
                     {
                         Ok(res) => Some(res),
                         Err(e) => {
-                            let msg = e.to_string();
-                            let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                                name: call.name.clone(),
-                                ok: false,
-                                content: msg.clone(),
-                                ui_type: None,
-                                parent: None,
-                                child_id: None,
-                            });
-                            history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                            continue;
+                            // A write's path is checked by this dry run, so a
+                            // refusal the host can lift becomes a question —
+                            // and one grant makes the same call go through.
+                            let retried = match &e {
+                                agent_tool::ToolError::OutOfScope { path, suggestion } => {
+                                    Some(
+                                        self.ask_scope_grant(
+                                            io,
+                                            call,
+                                            path,
+                                            suggestion.as_deref(),
+                                        )
+                                        .await,
+                                    )
+                                }
+                                _ => None,
+                            };
+                            let outcome = match retried {
+                                Some(Ok(())) => {
+                                    self.active_registry()
+                                        .dispatch(&call.name, args.clone(), self.ctx.clone())
+                                        .await
+                                }
+                                Some(Err(msg)) => Err(agent_tool::ToolError::Failed(msg)),
+                                None => Err(e),
+                            };
+                            match outcome {
+                                Ok(res) => Some(res),
+                                Err(e) => {
+                                    let msg = e.to_string();
+                                    let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                        name: call.name.clone(),
+                                        ok: false,
+                                        content: msg.clone(),
+                                        ui_type: None,
+                                        parent: None,
+                                        child_id: None,
+                                    });
+                                    history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
+                                    continue;
+                                }
+                            }
                         }
                     }
                 } else {
@@ -1411,15 +1448,16 @@ impl Engine {
                             tool_name: call.name.clone(),
                             diff: real_diff.clone(),
                             fuzzy: real_fuzzy,
+                            actions: Vec::new(),
                         });
-                        let approved = self.wait_for_decision(request_id, &io.cancel).await;
+                        let verdict = self.wait_for_decision(request_id, &io.cancel).await;
                         self.set_state(
                             io,
                             AgentState::ExecutingTool {
                                 tool_name: call.name.clone(),
                             },
                         );
-                        if !approved {
+                        if !verdict.approved {
                             let msg = format!("user denied {call_name}", call_name = call.name);
                             self.denials_this_turn.push(call.name.clone());
                             let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
@@ -1539,7 +1577,34 @@ impl Engine {
                             // names are reserved and can't be shadowed).
                             // External tools use the same result contract.
                             // Plan mode dispatches read-only built-ins only.
-                            if !self.plugins_allowed() {
+                            // A call that is not staged has no dry run: its
+                            // path is checked when it runs. A refusal the host
+                            // can lift becomes the same grant question, then
+                            // one more attempt with the wider reach.
+                            if let agent_tool::ToolError::OutOfScope { path, suggestion } = &e {
+                                let granted = self
+                                    .ask_scope_grant(io, call, path, suggestion.as_deref())
+                                    .await
+                                    .is_ok();
+                                if granted {
+                                    match self
+                                        .active_registry()
+                                        .dispatch(&call.name, args.clone(), self.ctx.clone())
+                                        .await
+                                    {
+                                        Ok(res) => (
+                                            res.content,
+                                            res.ui_type.map(|s| s.to_string()),
+                                            true,
+                                            res.commit,
+                                            res.images,
+                                        ),
+                                        Err(e) => (e.to_string(), None, false, None, Vec::new()),
+                                    }
+                                } else {
+                                    (e.to_string(), None, false, None, Vec::new())
+                                }
+                            } else if !self.plugins_allowed() {
                                 (e.to_string(), None, false, None, Vec::new())
                             } else if let Some(mgr) = self.plugins() {
                                 // Report the plugin's own failure. Its message names the
@@ -1875,11 +1940,102 @@ impl Engine {
     /// it is cleared and ignored rather than allowed to approve this tool
     /// (P1-a). Also returns `false` early if the user cancels while the
     /// approval is pending — a Cancel must not wait out the 300 s timeout.
+    /// A tool refused a path outside every root this session may reach, and
+    /// the host can still grant one: put the grants on the approval card, then
+    /// let the host apply the pick. `Ok(())` means "granted — run the same call
+    /// again"; the caller retries at most once, so a host that grants nothing
+    /// useful cannot loop the engine.
+    ///
+    /// Without a host slot this stays a plain refusal: the kernel has no idea
+    /// what a directory grant would even mean.
+    async fn ask_scope_grant(
+        &mut self,
+        io: &mut EngineIo,
+        call: &agent_llm_core::types::ToolCall,
+        path: &str,
+        suggestion: Option<&str>,
+    ) -> Result<(), String> {
+        const LINK_SESSION: &str = "link:session";
+        const LINK_PERSIST: &str = "link:workspace";
+        if !self.ctx.has_scope_grant() {
+            return Err(format!("path escapes workspace: {path}"));
+        }
+        // A read that escaped asks for read access, not for a writable
+        // checkout: the person answering this card was reading a file, and
+        // widening it to "edit anything under that project" is a grant they
+        // never saw. A write tool — and `bash`, which can write — still asks
+        // for the wider grant.
+        let readonly = self.active_registry().is_readonly(&call.name);
+        let access = if readonly { "read" } else { "readwrite" };
+        let grant_dir = suggestion.map_or_else(|| path.to_string(), str::to_string);
+        let scope_word = if readonly { "只读" } else { "读写" };
+        // The host decides what a link means; the kernel only names the two
+        // scopes every host that links directories offers.
+        let actions = vec![
+            agent_ipc::events::ApprovalAction {
+                id: LINK_SESSION.into(),
+                label: format!("关联（本会话 · {scope_word}）"),
+                description: Some(format!(
+                    "本次会话可以{scope_word}访问 {grant_dir}，会话结束即失效"
+                )),
+            },
+            agent_ipc::events::ApprovalAction {
+                id: LINK_PERSIST.into(),
+                label: format!("关联并记住（{scope_word}）"),
+                description: Some(format!(
+                    "这个工作区的每个会话都可以{scope_word}访问 {grant_dir}"
+                )),
+            },
+        ];
+        // What the user is being asked, in the order they need it: the
+        // directory that would be granted (and how far), then the path that
+        // was refused.
+        let diff = format!("关联目录：{grant_dir}（{scope_word}）\n被拒绝的路径：{path}");
+        let request_id = self
+            .next_request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.set_state(
+            io,
+            AgentState::AwaitingToolConfirmation {
+                tool_name: call.name.clone(),
+                diff_summary: diff.clone(),
+            },
+        );
+        let _ = io.ui_tx.send(UiEvent::ApprovalRequested {
+            request_id,
+            tool_name: call.name.clone(),
+            diff,
+            fuzzy: false,
+            actions,
+        });
+        let verdict = self.wait_for_decision(request_id, &io.cancel).await;
+        self.set_state(
+            io,
+            AgentState::ExecutingTool {
+                tool_name: call.name.clone(),
+            },
+        );
+        if !verdict.approved {
+            return Err(format!("user did not grant access to {path}"));
+        }
+        let Some(action) = verdict.action else {
+            return Err(format!("user did not grant access to {path}"));
+        };
+        if action != LINK_SESSION && action != LINK_PERSIST {
+            return Err(format!("`{action}` is not a grant this session offers"));
+        }
+        match self.ctx.grant_scope(&action, path, access) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(msg)) => Err(msg),
+            None => Err("this host cannot link directories".into()),
+        }
+    }
+
     async fn wait_for_decision(
         &self,
         request_id: u64,
         cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> bool {
+    ) -> crate::tools::registry::ToolVerdict {
         const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
         let deadline = std::time::Instant::now() + TIMEOUT;
         loop {
@@ -1888,29 +2044,22 @@ impl Engine {
             // MutexGuard is never held across `.await` (not `Send`).
             let verdict = {
                 let mut slot = self.decision.lock().unwrap_or_else(|e| e.into_inner());
-                match *slot {
-                    // This request's verdict — consume and return it.
-                    Some((id, approved)) if id == request_id => {
-                        *slot = None;
-                        Some(approved)
-                    }
-                    // A stale verdict (different request id) — drop it so it
-                    // can't accumulate, then keep waiting for OUR verdict.
-                    Some(_) => {
-                        *slot = None;
-                        None
-                    }
+                // `take` — the verdict is not `Copy`, and a stale one must not
+                // stay in the slot where it could answer a later request.
+                match slot.take() {
+                    Some((id, verdict)) if id == request_id => Some(verdict),
+                    Some(_) => None,
                     None => None,
                 }
             };
-            if let Some(approved) = verdict {
-                return approved;
+            if let Some(verdict) = verdict {
+                return verdict;
             }
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return false; // cancelled while awaiting approval → deny
+                return Default::default(); // cancelled while awaiting approval → deny
             }
             if std::time::Instant::now() > deadline {
-                return false; // fail-closed
+                return Default::default(); // fail-closed
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

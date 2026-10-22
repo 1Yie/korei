@@ -1,6 +1,7 @@
 //! Generic conversation tools and their registry.
 
 pub mod ask;
+pub mod link;
 pub mod batch;
 pub mod builtins;
 pub mod delegate;

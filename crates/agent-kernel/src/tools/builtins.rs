@@ -13,6 +13,7 @@ impl ToolRegistry {
         r.register(crate::tools::todo::spec());
         r.register(crate::tools::delegate::spec());
         r.register(crate::tools::ask::spec());
+        r.register(crate::tools::link::spec());
         r.register(crate::tools::batch::spec());
         r
     }
