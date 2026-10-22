@@ -175,6 +175,17 @@ pub enum ToolError {
     #[error("path escapes workspace: {0}")]
     PathEscape(String),
 
+    /// The path is outside every root this context may reach — and the host
+    /// can grant more. Unlike `PathEscape` this is a *question*, not a wall:
+    /// the engine turns it into an approval whose actions are the grants the
+    /// host offers, so one click makes the same call work. `suggestion` is the
+    /// project root worth granting (the tool's best guess, may be absent).
+    #[error("path escapes workspace: {path}")]
+    OutOfScope {
+        path: String,
+        suggestion: Option<String>,
+    },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
