@@ -90,6 +90,18 @@ pub struct AskOption {
     pub description: Option<String>,
 }
 
+/// One thing the user may do instead of a plain yes/no — a grant the host
+/// offers when a tool refused a path (associate another directory with the
+/// session). `id` is opaque to the UI: it echoes back in `ToolDecision` and
+/// only the host that offered it knows what it means.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalAction {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 /// Kernel → UI events. Every variant is displayable data — the frontend never
 /// re-parses text to figure out what happened.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,6 +181,12 @@ pub enum UiEvent {
         tool_name: String,
         diff: String,
         fuzzy: bool,
+        /// Alternatives to 允许/拒绝, offered when the tool's refusal is a
+        /// permission the host can grant (a path outside the workspace). An
+        /// empty list means an ordinary approve/deny card. Older readers see
+        /// the absent field as empty.
+        #[serde(default)]
+        actions: Vec<ApprovalAction>,
     },
     /// Final assistant text for the turn (complete, post-streaming).
     AssistantMessage(String),
