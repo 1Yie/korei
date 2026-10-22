@@ -868,6 +868,7 @@ impl Engine {
                                     let _ = io.ui_tx.send(UiEvent::ReasoningDelta {
                                         text,
                                         parent: None,
+                                        child_id: None,
                                     });
                                 }
                             }
@@ -875,7 +876,7 @@ impl Engine {
                                 round_text.push_str(t);
                                 coalesce.lock().unwrap_or_else(|e| e.into_inner()).text.push_str(t);
                                 if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_text(false) {
-                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
+                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None, child_id: None });
                                 }
                             }
                             StreamChunk::ToolCallDelta { .. } => {
@@ -887,10 +888,10 @@ impl Engine {
                                 // terminal event lands so the UI never
                                 // renders trailing text after Finished.
                                 if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_text(true) {
-                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
+                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None, child_id: None });
                                 }
                                 if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_reasoning(true) {
-                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None });
+                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None, child_id: None });
                                 }
                                 if let (Some(p), Some(c)) = (prompt_tokens, completion_tokens) {
                                     let cached = cached_tokens.unwrap_or(0);
@@ -910,10 +911,10 @@ impl Engine {
                             StreamChunk::Error(e) => {
                                 stream_error = Some(e.clone());
                                 if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_text(true) {
-                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
+                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None, child_id: None });
                                 }
                                 if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_reasoning(true) {
-                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None });
+                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None, child_id: None });
                                 }
                                 // The `*[error: e]*` marker + turn-end `Error` event
                                 // report this — no extra SystemMessage (it printed
@@ -942,10 +943,10 @@ impl Engine {
                         // until the user cancels. Push it out now.
                         let mut c = coalesce.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(text) = c.take_text(false) {
-                            let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
+                            let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None, child_id: None });
                         }
                         if let Some(text) = c.take_reasoning(false) {
-                            let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None });
+                            let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None, child_id: None });
                         }
                     },
                 ) => r,
@@ -957,12 +958,18 @@ impl Engine {
             {
                 let mut c = coalesce.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(text) = c.take_text(true) {
-                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None });
+                    let _ = io.ui_tx.send(UiEvent::TextDelta {
+                        text,
+                        parent: None,
+                        child_id: None,
+                    });
                 }
                 if let Some(text) = c.take_reasoning(true) {
-                    let _ = io
-                        .ui_tx
-                        .send(UiEvent::ReasoningDelta { text, parent: None });
+                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta {
+                        text,
+                        parent: None,
+                        child_id: None,
+                    });
                 }
             }
 

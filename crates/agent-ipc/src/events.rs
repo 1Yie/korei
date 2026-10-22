@@ -122,12 +122,19 @@ pub enum UiEvent {
         text: String,
         #[serde(default)]
         parent: Option<String>,
+        /// Same child marker as `ToolCallStarted::child_id` — a nested delta
+        /// names the subagent it belongs to, not just its label.
+        #[serde(default)]
+        child_id: Option<u64>,
     },
     /// Reasoning-trace delta (separate visual stream; same `parent` rule).
     ReasoningDelta {
         text: String,
         #[serde(default)]
         parent: Option<String>,
+        /// Same child marker as `ToolCallStarted::child_id`.
+        #[serde(default)]
+        child_id: Option<u64>,
     },
     /// A tool began executing. `args_preview` is a single-line summary of
     /// the call's target (a path / command / pattern) shown on the capsule —

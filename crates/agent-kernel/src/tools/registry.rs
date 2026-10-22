@@ -358,7 +358,14 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            ["ask_question", "batch_execute", "delegate", "link_workspace", "todo"]
+            [
+                "answer_child",
+                "ask_question",
+                "batch_execute",
+                "delegate",
+                "link_workspace",
+                "todo"
+            ]
         );
     }
 
@@ -371,11 +378,12 @@ mod tests {
         assert!(reg.is_readonly("todo"));
     }
 
-    /// A child may track tasks and batch calls, but cannot recurse or reach a human.
+    /// A child may track tasks and batch calls, and reach its parent, but cannot
+    /// recurse, answer children or reach a human.
     #[test]
     fn child_builtins_exclude_recursion_and_human_tools() {
         let child = ToolRegistry::child_builtins();
-        for banned in ["delegate", "ask_question"] {
+        for banned in ["delegate", "answer_child", "ask_question"] {
             assert!(
                 child.spec(banned).is_none(),
                 "child registry must not hold `{banned}`"
@@ -383,7 +391,15 @@ mod tests {
         }
         assert!(child.spec("todo").is_some());
         assert!(child.spec("batch_execute").is_some());
+        assert!(
+            child.spec("ask_parent").map(|s| s.readonly) == Some(true),
+            "a child must be able to ask its parent"
+        );
         // The parent still has the full set, so the exclusion is the child's alone.
         assert!(ToolRegistry::with_builtins().spec("delegate").is_some());
+        assert!(
+            ToolRegistry::with_builtins().spec("ask_parent").is_none(),
+            "a parent has no one to ask"
+        );
     }
 }

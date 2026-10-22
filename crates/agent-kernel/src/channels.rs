@@ -156,40 +156,67 @@ impl UiSink {
             // Deltas merge only with a tail from the *same* stream: a delegated
             // child's text must never be appended to the turn's draft (or to
             // another child's) just because both happen to be deltas.
-            UiEvent::TextDelta { text, parent } => {
+            UiEvent::TextDelta {
+                text,
+                parent,
+                child_id,
+            } => {
                 if under_watermark {
-                    queue.push_back(UiEvent::TextDelta { text, parent });
+                    queue.push_back(UiEvent::TextDelta {
+                        text,
+                        parent,
+                        child_id,
+                    });
                     self.inner.stats.sent.fetch_add(1, Ordering::Relaxed);
                 } else if let Some(UiEvent::TextDelta {
                     text: tail,
                     parent: tail_parent,
+                    child_id: tail_child,
                 }) = queue.back_mut()
                 {
-                    if *tail_parent != parent {
+                    if tail_parent.as_deref() != parent.as_deref() || *tail_child != child_id {
                         self.inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                        return Err(SendError::Saturated(UiEvent::TextDelta { text, parent }));
+                        return Err(SendError::Saturated(UiEvent::TextDelta {
+                            text,
+                            parent,
+                            child_id,
+                        }));
                     }
                     tail.push_str(&text);
                     self.inner.stats.coalesced.fetch_add(1, Ordering::Relaxed);
                 } else {
                     self.inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
-                    return Err(SendError::Saturated(UiEvent::TextDelta { text, parent }));
+                    return Err(SendError::Saturated(UiEvent::TextDelta {
+                        text,
+                        parent,
+                        child_id,
+                    }));
                 }
             }
-            UiEvent::ReasoningDelta { text, parent } => {
+            UiEvent::ReasoningDelta {
+                text,
+                parent,
+                child_id,
+            } => {
                 if under_watermark {
-                    queue.push_back(UiEvent::ReasoningDelta { text, parent });
+                    queue.push_back(UiEvent::ReasoningDelta {
+                        text,
+                        parent,
+                        child_id,
+                    });
                     self.inner.stats.sent.fetch_add(1, Ordering::Relaxed);
                 } else if let Some(UiEvent::ReasoningDelta {
                     text: tail,
                     parent: tail_parent,
+                    child_id: tail_child,
                 }) = queue.back_mut()
                 {
-                    if *tail_parent != parent {
+                    if tail_parent.as_deref() != parent.as_deref() || *tail_child != child_id {
                         self.inner.stats.dropped.fetch_add(1, Ordering::Relaxed);
                         return Err(SendError::Saturated(UiEvent::ReasoningDelta {
                             text,
                             parent,
+                            child_id,
                         }));
                     }
                     tail.push_str(&text);
@@ -199,6 +226,7 @@ impl UiSink {
                     return Err(SendError::Saturated(UiEvent::ReasoningDelta {
                         text,
                         parent,
+                        child_id,
                     }));
                 }
             }
@@ -327,6 +355,7 @@ mod tests {
         UiEvent::TextDelta {
             text: s.into(),
             parent: None,
+            child_id: None,
         }
     }
 
@@ -449,6 +478,7 @@ mod tests {
         let child = |s: &str| UiEvent::TextDelta {
             text: s.into(),
             parent: Some("subagent #1".into()),
+            child_id: Some(1),
         };
         let (tx, mut rx) = UiSink::channel();
         saturate(&tx); // saturated; the tail is the turn's own delta
@@ -468,10 +498,16 @@ mod tests {
             .expect_err("turn text must not merge into a child's tail");
 
         let events = drain(&mut rx);
-        let UiEvent::TextDelta { text, parent } = events.last().unwrap() else {
+        let UiEvent::TextDelta {
+            text,
+            parent,
+            child_id,
+        } = events.last().unwrap()
+        else {
             panic!("expected the child's delta as the tail: {events:?}");
         };
         assert_eq!(parent.as_deref(), Some("subagent #1"));
+        assert_eq!(*child_id, Some(1));
         assert!(text.ends_with("c1c2c3"), "{text}");
         assert_eq!(rx.stats().coalesced, 2);
     }
