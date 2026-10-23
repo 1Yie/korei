@@ -9,7 +9,7 @@
 //! returned tool calls, appends their results as `tool` messages and re-samples
 //! until a turn ends with none pending.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use agent_ipc::{AgentState, UiEvent};
@@ -52,6 +52,42 @@ const CANCEL_TEXT: &str = "已被用户中断";
 /// stop within a fraction of a second of the user hitting Cancel, not at its
 /// own timeout.
 const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long an approval card may stay unanswered before the kernel denies the
+/// call itself — a UI that never answers must not park the turn forever.
+const DEFAULT_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How an approval wait ended. A cancel, a timeout and a deliberate refusal
+/// are three different things: only the last one is the user's decision.
+enum DecisionWait {
+    /// The user answered the card.
+    Verdict(crate::tools::registry::ToolVerdict),
+    /// The turn was cancelled while the card was open.
+    Cancelled,
+    /// Nobody answered within `approval_timeout`.
+    TimedOut,
+}
+
+/// The model-facing text for an approval that ran out the clock. The model
+/// must not read the timeout as a deliberate refusal and route around it.
+fn approval_timeout_text(name: &str, secs: &str, repeated: bool) -> String {
+    let text = format!(
+        "[approval timeout] {name} was NOT run. The user did not respond to this permission \
+         request within {secs}s, so it was automatically denied by the safety policy. This is a \
+         timeout, not an active refusal by the user. Do not request the same permission again \
+         without new justification, and do not work around the denial by switching tools or \
+         splitting the operation. Prefer an alternative within the current permission scope; if \
+         you cannot continue safely, explain the limitation."
+    );
+    if repeated {
+        format!("{text} The identical request already timed out earlier in this turn.")
+    } else {
+        text
+    }
+}
+
+/// The approval card's short UI line when it timed out.
+const APPROVAL_TIMEOUT_UI: &str = "审批超时，已自动拒绝";
 
 /// Await `fut`, giving up as soon as the user cancels.
 ///
@@ -183,6 +219,9 @@ pub struct Engine {
     /// Tools the user denied via an approval card this turn — same provenance
     /// role as `steers_this_turn` for `TurnOutcome::denials`.
     denials_this_turn: Vec<String>,
+    /// Approvals that timed out this turn, keyed by tool name + canonical
+    /// args: the same call is not shown a second card that nobody will answer.
+    timed_out_approvals: HashSet<(String, String)>,
     /// Permission gate consulted before every tool dispatch.
     permissions: Arc<std::sync::RwLock<PermissionGate>>,
     /// Decision slot shared with SessionActor — the engine can't hold a
@@ -198,6 +237,9 @@ pub struct Engine {
     context_window: usize,
     /// Fraction of `context_window` that triggers compaction.
     compact_at: f32,
+    /// How long a pending approval waits for a verdict before the kernel
+    /// denies the call itself — zero means no deadline.
+    approval_timeout: std::time::Duration,
     /// Per-turn tool-loop bound — sessions use the default; delegated
     /// subagents get a smaller budget.
     max_tool_rounds: usize,
@@ -254,6 +296,7 @@ impl Engine {
             steer_queue: VecDeque::new(),
             steers_this_turn: Vec::new(),
             denials_this_turn: Vec::new(),
+            timed_out_approvals: HashSet::new(),
             permissions: Arc::new(std::sync::RwLock::new(PermissionGate::from_mode_str(
                 "default",
             ))),
@@ -261,6 +304,7 @@ impl Engine {
             next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             context_window: 256_000,
             compact_at: crate::compaction::COMPACT_AT,
+            approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
             max_tool_rounds: usize::MAX,
             model_input: Vec::new(),
             compaction_suppressor: CompactionSuppressor::default(),
@@ -446,6 +490,12 @@ impl Engine {
         self.compact_at
     }
 
+    /// Bound how long a pending approval may wait for a verdict. Zero = no
+    /// deadline. The default keeps the long-standing 300 s bound.
+    pub fn set_approval_timeout(&mut self, d: std::time::Duration) {
+        self.approval_timeout = d;
+    }
+
     /// SessionActor installs the permission gate (mode + repo rules).
     pub fn set_permissions(&mut self, gate: PermissionGate) {
         if let Ok(mut w) = self.permissions.write() {
@@ -626,6 +676,7 @@ impl Engine {
         // Fresh provenance record for this turn — see `TurnOutcome::steers`.
         self.steers_this_turn.clear();
         self.denials_this_turn.clear();
+        self.timed_out_approvals.clear();
         self.push_user_message(io, history, user_text, images);
         self.run_rounds(io, history, false).await
     }
@@ -644,6 +695,7 @@ impl Engine {
     ) -> Result<TurnOutcome, String> {
         self.steers_this_turn.clear();
         self.denials_this_turn.clear();
+        self.timed_out_approvals.clear();
         for text in notices {
             history.push(ChatMessage::host_notice(text));
         }
@@ -1417,6 +1469,28 @@ impl Engine {
                         continue;
                     }
                     Decision::Ask { diff_summary } => {
+                        let fingerprint = (call.name.clone(), args.to_string());
+                        // A call whose approval already ran out the clock this
+                        // turn is not shown a second card: the same wait would
+                        // only run out again.
+                        if self.timed_out_approvals.contains(&fingerprint) {
+                            self.denials_this_turn.push(call.name.clone());
+                            let msg = approval_timeout_text(
+                                &call.name,
+                                &crate::tools::host_slots::secs_label(self.approval_timeout),
+                                true,
+                            );
+                            let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                name: call.name.clone(),
+                                ok: false,
+                                content: APPROVAL_TIMEOUT_UI.to_string(),
+                                ui_type: None,
+                                parent: None,
+                                child_id: None,
+                            });
+                            history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
+                            continue;
+                        }
                         // Acquire any platform grant before asking for in-app
                         // approval. A refusal ends the call before the card.
                         if let Some(prepare) = review.prepare.take() {
@@ -1457,26 +1531,71 @@ impl Engine {
                             fuzzy: real_fuzzy,
                             actions: Vec::new(),
                         });
-                        let verdict = self.wait_for_decision(request_id, &io.cancel).await;
+                        let wait = self.wait_for_decision(request_id, &io.cancel).await;
                         self.set_state(
                             io,
                             AgentState::ExecutingTool {
                                 tool_name: call.name.clone(),
                             },
                         );
-                        if !verdict.approved {
-                            let msg = format!("user denied {call_name}", call_name = call.name);
-                            self.denials_this_turn.push(call.name.clone());
-                            let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                                name: call.name.clone(),
-                                ok: false,
-                                content: msg.clone(),
-                                ui_type: None,
-                                parent: None,
-                                child_id: None,
-                            });
-                            history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                            continue;
+                        match wait {
+                            DecisionWait::Verdict(v) if v.approved => {}
+                            DecisionWait::Verdict(_) => {
+                                let msg =
+                                    format!("user denied {call_name}", call_name = call.name);
+                                self.denials_this_turn.push(call.name.clone());
+                                let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                    name: call.name.clone(),
+                                    ok: false,
+                                    content: msg.clone(),
+                                    ui_type: None,
+                                    parent: None,
+                                    child_id: None,
+                                });
+                                history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
+                                continue;
+                            }
+                            // A cancel is the user abandoning the turn, not a
+                            // refusal of this tool — nothing to record as a denial.
+                            DecisionWait::Cancelled => {
+                                let msg = format!(
+                                    "{} was not run — the turn was cancelled while awaiting \
+                                     approval",
+                                    call.name
+                                );
+                                let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                    name: call.name.clone(),
+                                    ok: false,
+                                    content: msg.clone(),
+                                    ui_type: None,
+                                    parent: None,
+                                    child_id: None,
+                                });
+                                history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
+                                continue;
+                            }
+                            DecisionWait::TimedOut => {
+                                self.denials_this_turn.push(call.name.clone());
+                                self.timed_out_approvals.insert(fingerprint);
+                                let msg = approval_timeout_text(
+                                    &call.name,
+                                    &crate::tools::host_slots::secs_label(self.approval_timeout),
+                                    false,
+                                );
+                                let _ = io
+                                    .ui_tx
+                                    .send(UiEvent::ApprovalTimedOut { request_id });
+                                let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                    name: call.name.clone(),
+                                    ok: false,
+                                    content: APPROVAL_TIMEOUT_UI.to_string(),
+                                    ui_type: None,
+                                    parent: None,
+                                    child_id: None,
+                                });
+                                history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
+                                continue;
+                            }
                         }
                         // K3: approval and cancel/policy change can race —
                         // `wait_for_decision` returns a verdict that was already
@@ -1954,15 +2073,6 @@ impl Engine {
         }
     }
 
-    /// Poll the shared decision slot until SessionActor writes a verdict
-    /// for THIS `request_id`, or the safety timeout fires (fail-closed:
-    /// deny on timeout).
-    ///
-    /// The verdict slot holds `Option<(request_id, approved)>`. A verdict
-    /// whose id doesn't match is a stale click on an already-resolved card —
-    /// it is cleared and ignored rather than allowed to approve this tool
-    /// (P1-a). Also returns `false` early if the user cancels while the
-    /// approval is pending — a Cancel must not wait out the 300 s timeout.
     /// A tool refused a path outside every root this session may reach, and
     /// the host can still grant one: put the grants on the approval card, then
     /// let the host apply the pick. `Ok(())` means "granted — run the same call
@@ -2031,13 +2141,27 @@ impl Engine {
             fuzzy: false,
             actions,
         });
-        let verdict = self.wait_for_decision(request_id, &io.cancel).await;
+        let wait = self.wait_for_decision(request_id, &io.cancel).await;
         self.set_state(
             io,
             AgentState::ExecutingTool {
                 tool_name: call.name.clone(),
             },
         );
+        let verdict = match wait {
+            DecisionWait::Verdict(v) => v,
+            DecisionWait::Cancelled => {
+                return Err(format!("access grant for {path} was cancelled"));
+            }
+            DecisionWait::TimedOut => {
+                let _ = io.ui_tx.send(UiEvent::ApprovalTimedOut { request_id });
+                return Err(format!(
+                    "[approval timeout] access to {path} was not granted: the user did not \
+                     respond within {}s, so the request was automatically denied.",
+                    crate::tools::host_slots::secs_label(self.approval_timeout)
+                ));
+            }
+        };
         if !verdict.approved {
             return Err(format!("user did not grant access to {path}"));
         }
@@ -2054,13 +2178,23 @@ impl Engine {
         }
     }
 
+    /// Poll the shared decision slot until SessionActor writes a verdict
+    /// for THIS `request_id`, the turn is cancelled, or the approval timeout
+    /// fires (fail-closed: a timeout denies the call).
+    ///
+    /// The verdict slot holds `Option<(request_id, verdict)>`. A verdict
+    /// whose id doesn't match is a stale click on an already-resolved card —
+    /// it is cleared and ignored rather than allowed to approve this tool
+    /// (P1-a). A timeout takes the slot under the same lock, so a verdict
+    /// that lands afterwards has nowhere to go and the next card (a new id)
+    /// cannot be answered by it. Cancelling does not wait out the timeout.
     async fn wait_for_decision(
         &self,
         request_id: u64,
         cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> crate::tools::registry::ToolVerdict {
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-        let deadline = std::time::Instant::now() + TIMEOUT;
+    ) -> DecisionWait {
+        let deadline = (!self.approval_timeout.is_zero())
+            .then(|| std::time::Instant::now() + self.approval_timeout);
         loop {
             // Poison-safe: a panicked writer must not deadlock the engine.
             // Take the verdict out of the slot in a short scope so the
@@ -2076,13 +2210,20 @@ impl Engine {
                 }
             };
             if let Some(verdict) = verdict {
-                return verdict;
+                return DecisionWait::Verdict(verdict);
             }
             if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return Default::default(); // cancelled while awaiting approval → deny
+                return DecisionWait::Cancelled;
             }
-            if std::time::Instant::now() > deadline {
-                return Default::default(); // fail-closed
+            if deadline.is_some_and(|d| std::time::Instant::now() > d) {
+                // Close the card under the slot's own lock: whatever arrives
+                // after this point is a late click and is discarded.
+                let _ = self
+                    .decision
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                return DecisionWait::TimedOut;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }

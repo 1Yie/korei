@@ -178,6 +178,10 @@ pub enum UiEvent {
     /// rather than hiding it behind a per-mount flag that a session switch
     /// would reset (the "answered card comes back" bug).
     QuestionAnswered { request_id: u64 },
+    /// The question's deadline expired before anyone answered — the kernel
+    /// already closed the card and handed the model a timeout. The UI marks
+    /// the card as timed out instead of leaving it answerable.
+    QuestionTimedOut { request_id: u64 },
     /// A destructive op paused for review — `diff` is the unified diff for
     /// the approval card; `fuzzy` flags an approximate patch match.
     /// `request_id` is the correlation token the frontend echoes back in
@@ -195,6 +199,10 @@ pub enum UiEvent {
         #[serde(default)]
         actions: Vec<ApprovalAction>,
     },
+    /// The approval card's deadline expired unanswered — the request was
+    /// denied automatically (`ToolCallFinished` carries the result). The UI
+    /// marks the card as timed out so a late click can't look meaningful.
+    ApprovalTimedOut { request_id: u64 },
     /// Final assistant text for the turn (complete, post-streaming).
     AssistantMessage(String),
     /// The session's tool whitelist just gained `tool_name` — emitted when

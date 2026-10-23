@@ -1,10 +1,12 @@
 //! `ask_question` — structured user input mid-turn: a question plus up to four
 //! labelled options, rendered as a card in the approval slot. The call blocks
-//! until the user answers or the turn is cancelled.
+//! until the user answers, the turn is cancelled, or the question's deadline
+//! expires; a timeout is handed back to the model as a result, never parked.
 //!
 //! `readonly: true` — asking mutates nothing, so it auto-allows in every mode.
 //! Headless contexts carry no UI sender and refuse fast instead of deadlocking.
 
+use super::host_slots::{secs_label, AskOutcome};
 use super::registry::{Args, ToolCtx, ToolError, ToolResult, ToolSpec};
 use futures::FutureExt;
 
@@ -105,15 +107,47 @@ async fn exec(args: Args, ctx: std::sync::Arc<ToolCtx>) -> Result<ToolResult, To
         });
     }
 
-    let answer = ask
+    let outcome = ask
         .ask(question.to_string(), options.clone(), ctx.cancel.clone())
         .await?;
-    // Echo which structured option the answer maps to — the UI knows
-    // it was a click vs free text, and telemetry can consume the index
-    // without re-parsing prose.
-    let result = match options.iter().position(|o| o.label == answer) {
-        Some(i) => format!("用户回答：{answer}（选项 {i}）"),
-        None => format!("用户回答（自定义）：{answer}"),
-    };
-    Ok(ToolResult::text(result))
+    match outcome {
+        // Echo which structured option the answer maps to — the UI knows
+        // it was a click vs free text, and telemetry can consume the index
+        // without re-parsing prose.
+        AskOutcome::Answered(answer) => {
+            let result = match options.iter().position(|o| o.label == answer) {
+                Some(i) => format!("用户回答：{answer}（选项 {i}）"),
+                None => format!("用户回答（自定义）：{answer}"),
+            };
+            Ok(ToolResult::text(result))
+        }
+        // A timeout is not an answer: the model must decide for itself
+        // instead of reading the silence as consent to any option.
+        AskOutcome::TimedOut { after, repeated } => {
+            let labels = if options.is_empty() {
+                "none offered".to_string()
+            } else {
+                options
+                    .iter()
+                    .map(|o| o.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            };
+            let mut text = format!(
+                "[ask_question timeout] The user did not answer this question within {}s; the \
+                 question has timed out. This is NOT a choice — do not treat the lack of response \
+                 as consent or as picking any option. Decide the most reasonable next step from \
+                 the task goal, the context you already have and the offered options ({labels}), \
+                 preferring a safe, conservative path that needs no extra authorization. Do not \
+                 ask the same or an equivalent question again unless you truly cannot continue. \
+                 Anything irreversible, risky, sensitive, or that explicitly requires the user's \
+                 decision must NOT be done on the basis of this timeout.",
+                secs_label(after)
+            );
+            if repeated {
+                text.push_str(" The same question already timed out; it was not shown again.");
+            }
+            Ok(ToolResult::text(text))
+        }
+    }
 }

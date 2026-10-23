@@ -29,6 +29,40 @@ pub struct ScopeGrantSlot(
 
 use super::registry::{ToolCtx, ToolError};
 
+/// How long a question may stay unanswered before the kernel gives it back —
+/// a UI that never answers must not park the turn forever.
+const DEFAULT_ASK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// How many timed-out questions one turn is remembered for the repeat guard.
+const TIMED_OUT_QUESTIONS: usize = 32;
+
+/// Render a timeout for the model-facing texts: whole seconds when the
+/// setting is whole, otherwise its fractional value.
+pub(crate) fn secs_label(d: std::time::Duration) -> String {
+    if d.subsec_nanos() == 0 {
+        d.as_secs().to_string()
+    } else {
+        format!("{:.3}", d.as_secs_f64())
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
+    }
+}
+
+/// What came back from [`AskChannel::ask`].
+#[derive(Debug, Clone)]
+pub enum AskOutcome {
+    /// The user answered; the text is what they clicked or typed.
+    Answered(String),
+    /// Nobody answered before the channel's timeout.
+    TimedOut {
+        /// How long the card waited.
+        after: std::time::Duration,
+        /// The same question already timed out, so no card was shown.
+        repeated: bool,
+    },
+}
+
 /// The structured-question channel — `ask_question` parks a oneshot here,
 /// emits `QuestionAsked` through `ui_tx`, and awaits the answer with the
 /// same cancel poll as `wait_for_decision`. Headless contexts get
@@ -39,6 +73,11 @@ pub struct AskChannel {
     pub ui_tx: Option<crate::channels::UiSink>,
     pending: std::sync::Mutex<Option<(u64, tokio::sync::oneshot::Sender<String>)>>,
     next_id: std::sync::atomic::AtomicU64,
+    /// How long a question may stay unanswered — zero means no deadline.
+    timeout: std::sync::Mutex<std::time::Duration>,
+    /// Normalized texts that already timed out: the same question is handed
+    /// the timeout again instead of a second card nobody will answer.
+    timed_out: std::sync::Mutex<Vec<String>>,
 }
 
 impl AskChannel {
@@ -47,7 +86,23 @@ impl AskChannel {
             ui_tx,
             pending: std::sync::Mutex::new(None),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            timeout: std::sync::Mutex::new(DEFAULT_ASK_TIMEOUT),
+            timed_out: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Bound how long a question may stay unanswered. Zero = no deadline.
+    pub fn set_timeout(&self, d: std::time::Duration) {
+        *self.timeout.lock().unwrap_or_else(|e| e.into_inner()) = d;
+    }
+
+    /// Forget which questions timed out. The host calls this at turn start so
+    /// a question asked in a new turn is shown again.
+    pub fn reset_timed_out(&self) {
+        self.timed_out
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Interactive? `None` ui_tx means headless (subagent, test) — the
@@ -57,23 +112,44 @@ impl AskChannel {
         self.ui_tx.is_some()
     }
 
-    /// Emit the card, park the answer oneshot, await it (or cancellation).
+    /// Emit the card, park the answer oneshot, await it (or cancellation, or
+    /// the timeout).
     pub async fn ask(
         &self,
         question: String,
         options: Vec<agent_ipc::events::AskOption>,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    ) -> Result<String, ToolError> {
+    ) -> Result<AskOutcome, ToolError> {
         let Some(ui_tx) = &self.ui_tx else {
             return Err(ToolError::Failed(
                 "ask_question unavailable — no UI channel in this context".into(),
             ));
         };
+        let timeout = *self.timeout.lock().unwrap_or_else(|e| e.into_inner());
+        let normalized = question
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        if self
+            .timed_out
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|q| q == &normalized)
+        {
+            // The same question can only run out the clock again — hand the
+            // model the timeout now instead of drawing a card nobody answers.
+            return Ok(AskOutcome::TimedOut {
+                after: std::time::Duration::ZERO,
+                repeated: true,
+            });
+        }
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        *self.pending.lock().unwrap() = Some((id, tx));
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some((id, tx));
         if ui_tx
             .send(agent_ipc::events::UiEvent::QuestionAsked {
                 request_id: id,
@@ -82,24 +158,60 @@ impl AskChannel {
             })
             .is_err()
         {
-            *self.pending.lock().unwrap() = None;
+            *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
             return Err(ToolError::Failed(
                 "ask_question failed — UI event channel is closed".into(),
             ));
         }
         let mut rx = std::pin::pin!(rx);
+        let deadline = (!timeout.is_zero()).then(|| tokio::time::Instant::now() + timeout);
         loop {
             tokio::select! {
                 r = &mut rx => {
-                    return r.map_err(|_| ToolError::Failed(
+                    return r.map(AskOutcome::Answered).map_err(|_| ToolError::Failed(
                         "question channel closed before an answer arrived".into(),
                     ));
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
                     if cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)) {
-                        *self.pending.lock().unwrap() = None;
+                        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         return Err(ToolError::Failed("cancelled".into()));
                     }
+                    let Some(deadline) = deadline else { continue };
+                    if tokio::time::Instant::now() < deadline {
+                        continue;
+                    }
+                    // Exactly one side wins: if `answer` already took the
+                    // entry, the text is on its way and must still be
+                    // returned; otherwise the parked card is ours to close.
+                    let answered_first = {
+                        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                        match pending.as_ref() {
+                            Some((parked, _)) if *parked == id => {
+                                *pending = None;
+                                false
+                            }
+                            // Our card is no longer parked — cleared by the host.
+                            Some(_) | None => true,
+                        }
+                    };
+                    if answered_first {
+                        return rx.await.map(AskOutcome::Answered).map_err(|_| ToolError::Failed(
+                            "question channel closed before an answer arrived".into(),
+                        ));
+                    }
+                    {
+                        let mut timed_out =
+                            self.timed_out.lock().unwrap_or_else(|e| e.into_inner());
+                        if timed_out.len() >= TIMED_OUT_QUESTIONS {
+                            timed_out.remove(0);
+                        }
+                        timed_out.push(normalized);
+                    }
+                    let _ = ui_tx.send(agent_ipc::events::UiEvent::QuestionTimedOut {
+                        request_id: id,
+                    });
+                    return Ok(AskOutcome::TimedOut { after: timeout, repeated: false });
                 }
             }
         }
@@ -108,10 +220,10 @@ impl AskChannel {
     /// `AnswerQuestion` writes here — resolves the parked oneshot when the
     /// id matches (a stale answer for a cleared question is ignored).
     pub fn answer(&self, request_id: u64, answer: String) -> bool {
-        match self.pending.lock().unwrap().take() {
+        match self.pending.lock().unwrap_or_else(|e| e.into_inner()).take() {
             Some((id, tx)) if id == request_id => tx.send(answer).is_ok(),
             Some(p) => {
-                *self.pending.lock().unwrap() = Some(p);
+                *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
                 false
             }
             None => false,
@@ -120,7 +232,7 @@ impl AskChannel {
 
     /// Cancel path — dropping the oneshot wakes `ask()` with an error.
     pub fn clear(&self) {
-        *self.pending.lock().unwrap() = None;
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
