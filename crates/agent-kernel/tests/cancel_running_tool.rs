@@ -35,6 +35,7 @@ fn slow_tool(dropped: Arc<AtomicBool>) -> ToolSpec {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(move |_args, _ctx| {
             let dropped = dropped.clone();
             async move {
@@ -152,6 +153,7 @@ fn cancelling_tool(flag: Arc<AtomicBool>) -> ToolSpec {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(move |_args, _ctx| {
             let flag = flag.clone();
             async move {

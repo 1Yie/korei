@@ -376,6 +376,7 @@ pub fn spec_with(profile: BatchProfile) -> ToolSpec {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(move |args, ctx| exec(args, ctx, profile.clone()).boxed()),
     }
 }

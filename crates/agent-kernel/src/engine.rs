@@ -1552,24 +1552,40 @@ impl Engine {
                     let ui_type = res.ui_type.map(|s| s.to_string());
                     (res.content, ui_type, true, res.commit, res.images)
                 } else {
-                    // A `bash` (or the test suite under it) can run for
-                    // minutes. Race it against the flag so Cancel lands
-                    // now, not after the tool's own timeout.
-                    let Some(dispatched) = until_cancelled(
-                        &io.cancel,
+                    // A cancel-aware tool watches `ctx.cancel` itself and ends
+                    // with its own terminal text — which is the result that
+                    // has to be recorded (a cancelled child names itself
+                    // there). Racing it here would drop that text for a
+                    // generic line, and the UI could no longer tie the card
+                    // to the child's transcript.
+                    let cancel_aware = registry
+                        .spec(&call.name)
+                        .is_some_and(|s| s.cancel_aware);
+                    let dispatched = if cancel_aware {
                         self.active_registry()
-                            .dispatch(&call.name, args.clone(), self.ctx.clone()),
-                    )
-                    .await
-                    else {
-                        return self.abort_cancelled(
-                            io,
-                            history,
-                            &calls,
-                            call_idx,
-                            "cancelled while running",
-                            Some(call.name.clone()),
-                        );
+                            .dispatch(&call.name, args.clone(), self.ctx.clone())
+                            .await
+                    } else {
+                        // A `bash` (or the test suite under it) can run for
+                        // minutes. Race it against the flag so Cancel lands
+                        // now, not after the tool's own timeout.
+                        let Some(dispatched) = until_cancelled(
+                            &io.cancel,
+                            self.active_registry()
+                                .dispatch(&call.name, args.clone(), self.ctx.clone()),
+                        )
+                        .await
+                        else {
+                            return self.abort_cancelled(
+                                io,
+                                history,
+                                &calls,
+                                call_idx,
+                                "cancelled while running",
+                                Some(call.name.clone()),
+                            );
+                        };
+                        dispatched
                     };
                     match dispatched {
                         Ok(res) => (

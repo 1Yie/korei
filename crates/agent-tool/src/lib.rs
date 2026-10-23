@@ -283,6 +283,12 @@ pub struct ToolSpec<C> {
     /// How this tool describes a call before approval. `None` for the common
     /// tool: the engine's generic summary applies.
     pub review: Option<ReviewFn<C>>,
+    /// The tool observes the caller's cancel flag itself and ends with its own
+    /// terminal text. The engine then awaits it instead of racing it against
+    /// the flag, so the result the tool wrote is the one recorded — a racing
+    /// abort would replace it with a generic line and drop what the tool knew
+    /// (which child it stopped, for `delegate`).
+    pub cancel_aware: bool,
     pub exec: ExecFn<C>,
 }
 
@@ -356,6 +362,7 @@ mod tests {
             network: false,
             staged: false,
             review: None,
+            cancel_aware: false,
             exec: Arc::new(|_args: Args, _ctx: Arc<Host>| {
                 Box::pin(async move { Ok(ToolResult::text("ok")) })
             }),

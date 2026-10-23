@@ -414,8 +414,14 @@ impl ChildJournal {
     }
 
     /// Replace the mirror with the history the child is about to send.
+    ///
+    /// The write goes out on every round instead of only when the child stops:
+    /// an app quit between rounds is exactly the case that leaves no
+    /// transcript at all otherwise, and the host's write is cheap and atomic.
+    /// Park, abort and the end of the turn still write explicitly.
     fn snapshot(&self, messages: &[ChatMessage]) {
         *self.history.lock().unwrap_or_else(|e| e.into_inner()) = messages.to_vec();
+        self.persist();
     }
 }
 
@@ -663,11 +669,25 @@ async fn await_outcome(
             _ = tokio::time::sleep(OUTCOME_POLL) => {
                 if cancel.load(std::sync::atomic::Ordering::Relaxed) {
                     abort_child(session, id);
-                    return Err(format!("subagent {id} was cancelled"));
+                    return Err(cancel_marker(id));
                 }
             }
         }
     }
+}
+
+/// The result text a cancelled delegation records. Parsable on purpose: the
+/// child's transcript and its card are keyed by `child_id`, so the id has to
+/// survive in the tool result the history keeps — a live event is not enough,
+/// a reloaded turn would have nothing to tie the card to.
+fn cancel_marker(id: u64) -> String {
+    format!("[subagent cancelled — child_id {id}]")
+}
+
+/// Whether a child's error text is that marker — the parallel aggregate heads
+/// such a section `cancelled` instead of `failed`.
+fn is_cancel_marker(text: &str) -> bool {
+    text.starts_with("[subagent cancelled — child_id ")
 }
 
 /// The text `delegate`/`answer_child` hand back instead of a report when the
@@ -840,7 +860,14 @@ impl SubagentSpawner {
                 }
                 Err(e) => {
                     failed += 1;
-                    body.push_str(&format!("\n── [{i}] failed ──\n{e}\n"));
+                    // A cancelled child is not a failed one: the section says
+                    // which it was, and the marker inside `e` carries its id.
+                    let head = if is_cancel_marker(&e) {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
+                    body.push_str(&format!("\n── [{i}] {head} ──\n{e}\n"));
                 }
             }
         }
@@ -1041,6 +1068,13 @@ impl SubagentSpawner {
         // Whatever came back, the child is not this call's to kill any more: a
         // parked child belongs to the session until it is answered or cancelled.
         guard.armed = false;
+        // The child's own turn aborts on the same flag, so which side notices
+        // first is a race. The result must not depend on it: once the flag is
+        // up this call is a cancellation and says so, with the child's id.
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            abort_child(owner, child_id);
+            return Err(cancel_marker(child_id));
+        }
         match first {
             Ok(ChildOutcome::Asked(question)) => {
                 emit_waiting(&parent_ctx, child_id, label, &question);
@@ -1263,6 +1297,9 @@ pub fn spec() -> ToolSpec {
         network: false,
         staged: false,
         review: None,
+        // A cancelled child ends this call itself, naming the child it stopped
+        // — racing the turn's cancel here would throw that id away.
+        cancel_aware: true,
         exec: Arc::new(|args, ctx| exec(args, ctx).boxed()),
     }
 }
@@ -1427,6 +1464,7 @@ pub fn ask_parent_spec() -> ToolSpec {
         network: false,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, ctx| ask_parent_exec(args, ctx).boxed()),
     }
 }
@@ -1504,6 +1542,9 @@ pub fn answer_child_spec() -> ToolSpec {
         network: false,
         staged: false,
         review: None,
+        // Resuming a child can end on the parent's cancel, and that result has
+        // to name the child rather than a generic turn-cancelled line.
+        cancel_aware: true,
         exec: Arc::new(|args, ctx| answer_child_exec(args, ctx).boxed()),
     }
 }
@@ -1532,6 +1573,12 @@ async fn answer_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, 
     // The child is the session's again: whether it parks or finishes, this call
     // does not own its lifetime.
     guard.armed = false;
+    // Same rule as `delegate`: a cancel ends this call with the child named,
+    // whichever side noticed the flag first.
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        abort_child(session, parsed.child_id);
+        return Err(ToolError::Failed(cancel_marker(parsed.child_id)));
+    }
     match next {
         Ok(ChildOutcome::Done { ok: true, report }) => Ok(ToolResult::text(report)),
         Ok(ChildOutcome::Done {

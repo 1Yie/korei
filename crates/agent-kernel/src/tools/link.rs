@@ -44,6 +44,7 @@ pub fn spec() -> ToolSpec {
         network: false,
         staged: false,
         review: Some(std::sync::Arc::new(review)),
+        cancel_aware: false,
         exec: std::sync::Arc::new(|args, ctx| exec(args, ctx).boxed()),
     }
 }

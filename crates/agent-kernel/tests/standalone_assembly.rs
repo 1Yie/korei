@@ -26,6 +26,7 @@ fn ssh_exec() -> ToolSpec {
         network: true,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, _ctx| {
             async move {
                 let host = args.get("host").and_then(|v| v.as_str()).unwrap_or("?");
@@ -52,6 +53,7 @@ fn list_remote() -> ToolSpec {
         network: true,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|_args, _ctx| {
             async move { Ok(ToolResult::text("var/\netc/\nopt/")) }.boxed()
         }),
@@ -72,6 +74,7 @@ fn read_remote() -> ToolSpec {
         network: true,
         staged: false,
         review: None,
+        cancel_aware: false,
         exec: Arc::new(|args, _ctx| {
             async move {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("?");
