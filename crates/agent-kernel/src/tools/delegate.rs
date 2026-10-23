@@ -290,14 +290,28 @@ static ACTIVE_STEERS: std::sync::Mutex<Option<ActiveSteers>> = std::sync::Mutex:
 #[derive(Default)]
 struct ActiveSteers {
     next: u64,
-    channels: std::collections::HashMap<u64, ActiveChild>,
+    channels: std::collections::HashMap<u64, SteerEntry>,
 }
 
 /// One live child: the session that owns it, and the channel that steers it.
 /// Kept together so a child can never be registered without its owner.
-struct ActiveChild {
+struct SteerEntry {
     session: i64,
     tx: tokio::sync::mpsc::Sender<String>,
+}
+
+/// One running child as the UI needs it. A webview that reloads mid-turn loses
+/// every live event that drew the child's card, and history has no row for a
+/// child still running — this is the only description of it left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveChild {
+    pub child_id: u64,
+    /// The card label (`subagent`, `review #1`, …).
+    pub label: String,
+    /// The instruction the child was handed — the card's chip text.
+    pub task: String,
+    /// The question it is parked on for its parent, while it waits.
+    pub waiting: Option<String>,
 }
 
 /// `session` is the parent's session id, or `0` when the parent has none (a test
@@ -307,7 +321,7 @@ fn register_steer(session: i64, tx: tokio::sync::mpsc::Sender<String>) -> u64 {
     let active = guard.get_or_insert_with(Default::default);
     active.next += 1;
     let id = active.next;
-    active.channels.insert(id, ActiveChild { session, tx });
+    active.channels.insert(id, SteerEntry { session, tx });
     id
 }
 
@@ -339,6 +353,34 @@ pub fn active_children(session: i64) -> Vec<u64> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The running children owned by `session`, with the label, task and question
+/// the UI needs to redraw their cards. A reloaded webview has nothing else:
+/// the events that drew them are gone and history holds no row until the child
+/// reports. Sorted by id so a redraw is stable across calls.
+pub fn active_child_infos(session: i64) -> Vec<ActiveChild> {
+    let guard = ACTIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out: Vec<ActiveChild> = guard
+        .as_ref()
+        .map(|live| {
+            live.iter()
+                .filter(|(_, h)| h.session == session)
+                .map(|(id, h)| ActiveChild {
+                    child_id: *id,
+                    label: h.card.label.clone(),
+                    task: h.task.clone(),
+                    waiting: h
+                        .waiting
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by_key(|c| c.child_id);
+    out
 }
 
 /// Deliver a steering message to a running child owned by `session`. Between tool
@@ -469,6 +511,8 @@ struct ChildHandle {
     /// The parent session that owns it — a foreign session may not answer it.
     session: i64,
     card: ChildCard,
+    /// The instruction it was handed — the chip a redrawn card shows.
+    task: String,
     /// The child's own history mirror: an abort persists from here, because the
     /// aborted task never runs its tail.
     journal: Arc<ChildJournal>,
@@ -481,6 +525,9 @@ struct ChildHandle {
     /// The parked `ask_parent` call's answer channel; `Some` only while the
     /// child is waiting on its parent.
     pending: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    /// The question that park is waiting on, set and cleared with `pending` so
+    /// the two can never disagree.
+    waiting: Arc<std::sync::Mutex<Option<String>>>,
     /// Set once the task exists. Aborting it drops the child's turn future,
     /// which is what closes its card as interrupted.
     abort: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
@@ -492,6 +539,7 @@ struct ChildRef {
     card: ChildCard,
     outcomes: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ChildOutcome>>>,
     pending: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    waiting: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 static ACTIVE_CHILDREN: std::sync::Mutex<Option<std::collections::HashMap<u64, ChildHandle>>> =
@@ -503,20 +551,24 @@ fn register_child(
     session: i64,
     id: u64,
     card: ChildCard,
+    task: String,
     journal: Arc<ChildJournal>,
     tx: tokio::sync::mpsc::Sender<ChildOutcome>,
     rx: tokio::sync::mpsc::Receiver<ChildOutcome>,
 ) -> (ChildRef, Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>) {
     let outcomes = Arc::new(tokio::sync::Mutex::new(rx));
     let pending = Arc::new(std::sync::Mutex::new(None));
+    let waiting = Arc::new(std::sync::Mutex::new(None));
     let abort = Arc::new(std::sync::Mutex::new(None));
     let handle = ChildHandle {
         session,
         card: card.clone(),
+        task,
         journal,
         outcomes: outcomes.clone(),
         outcomes_tx: tx.clone(),
         pending: pending.clone(),
+        waiting: waiting.clone(),
         abort: abort.clone(),
     };
     let mut guard = ACTIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
@@ -526,6 +578,7 @@ fn register_child(
             card,
             outcomes,
             pending,
+            waiting,
         },
         abort,
     )
@@ -557,6 +610,7 @@ fn owned_child(session: i64, id: u64) -> Result<ChildRef, String> {
             card: h.card.clone(),
             outcomes: h.outcomes.clone(),
             pending: h.pending.clone(),
+            waiting: h.waiting.clone(),
         })
         .ok_or_else(|| format!("no running subagent with id {id}"))
 }
@@ -593,6 +647,11 @@ fn clear_pending(id: u64) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        let _ = handle
+            .waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 }
 
@@ -626,6 +685,7 @@ fn park_child(id: u64, question: String) -> Result<tokio::sync::oneshot::Receive
         }
         let handle = live.get_mut(&id).expect("looked up just above");
         *handle.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        *handle.waiting.lock().unwrap_or_else(|e| e.into_inner()) = Some(question.clone());
         handle.outcomes_tx.clone()
     };
     if outcomes.try_send(ChildOutcome::Asked(question)).is_err() {
@@ -647,6 +707,12 @@ fn deliver_answer(session: i64, id: u64, answer: String) -> Result<ChildRef, Str
     let Some(tx) = waiting else {
         return Err(format!("subagent {id} is not waiting for an answer"));
     };
+    // The child stops waiting the moment its answer is on the way in.
+    let _ = child
+        .waiting
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     tx.send(answer)
         .map_err(|_| format!("subagent {id} stopped waiting before the answer arrived"))?;
     Ok(child)
@@ -926,6 +992,7 @@ impl SubagentSpawner {
             owner,
             child_id,
             card.clone(),
+            task.clone(),
             journal.clone(),
             outcome_tx.clone(),
             outcome_rx,
@@ -1721,6 +1788,69 @@ mod tests {
             child_report(2, 0, 0.0, "x"),
             "two children's reports must not read the same"
         );
+    }
+
+    /// A reloaded webview has no live events, and history holds no row for a
+    /// child still mid-turn: the registry is the only thing left that can
+    /// redraw its card, so it must carry the label, the task and the question
+    /// the child parked on.
+    #[test]
+    fn active_child_infos_carry_label_task_and_waiting() {
+        let _lock = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let parent = Arc::new(ToolCtx::new());
+        let (outcomes_tx, outcomes_rx) = tokio::sync::mpsc::channel(8);
+        let id = 8_000_001;
+        let journal = Arc::new(ChildJournal {
+            history: std::sync::Mutex::new(Vec::new()),
+            host: Arc::new(NoopSubagentHost),
+            parent: parent.clone(),
+            id,
+            label: "review #1".into(),
+        });
+        let card = ChildCard::arm(parent, id, "review #1".into());
+        let (_child, _abort) = register_child(
+            77,
+            id,
+            card,
+            "看鉴权分支".into(),
+            journal,
+            outcomes_tx,
+            outcomes_rx,
+        );
+        let _entry = ChildGuard(id);
+
+        let mine = active_child_infos(77)
+            .into_iter()
+            .find(|c| c.child_id == id)
+            .expect("a live child must be listed");
+        assert_eq!(mine.label, "review #1");
+        assert_eq!(mine.task, "看鉴权分支");
+        assert_eq!(mine.waiting, None, "not parked yet");
+        assert!(
+            active_child_infos(78).iter().all(|c| c.child_id != id),
+            "another session must not see it"
+        );
+
+        // Parked: the question is what the redrawn card shows as waiting.
+        let rx = park_child(id, "which crate?".into()).expect("the child is live");
+        let parked = active_child_infos(77)
+            .into_iter()
+            .find(|c| c.child_id == id)
+            .expect("a parked child is still running");
+        assert_eq!(parked.waiting.as_deref(), Some("which crate?"));
+
+        // Answered: it runs again, so the card stops reading as waiting.
+        deliver_answer(77, id, "korei".into()).expect("the answer reaches the parked child");
+        assert!(
+            active_child_infos(77)
+                .into_iter()
+                .find(|c| c.child_id == id)
+                .expect("still running")
+                .waiting
+                .is_none(),
+            "an answered child is not waiting any more"
+        );
+        drop(rx);
     }
 
     /// A session lists only its own running children.
