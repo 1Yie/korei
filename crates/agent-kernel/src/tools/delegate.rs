@@ -15,7 +15,8 @@ use super::registry::{schema_for, Args, ToolCtx, ToolError, ToolRegistry, ToolRe
 use crate::engine::{Engine, EngineIo};
 use crate::permissions::PermissionGate;
 use agent_ipc::events::UiEvent;
-use agent_llm_core::types::ChatMessage;
+use agent_llm_core::types::{ChatMessage, StreamChunk};
+use agent_llm_core::{BoxStream, Capabilities, LlmProvider, ModelParams};
 
 /// The child's system prompt — intentionally small: the parent's request
 /// carries the task context; the prompt only sets behavior contract.
@@ -376,6 +377,85 @@ pub struct ChildIdentity {
     pub outcomes: tokio::sync::mpsc::Sender<ChildOutcome>,
 }
 
+/// The child's history mirror, shared between the child's own `ToolCtx` and its
+/// registry entry. A child that parks on `ask_parent` or is aborted never
+/// reaches the end of its turn, so the turn's own persist cannot be the only
+/// write: this snapshots the history at the moment the child stops.
+pub struct ChildJournal {
+    /// The last history the child's provider was asked to run on, plus anything
+    /// noted since.
+    history: std::sync::Mutex<Vec<ChatMessage>>,
+    host: Arc<dyn SubagentHost>,
+    parent: Arc<ToolCtx>,
+    id: u64,
+    label: String,
+}
+
+impl ChildJournal {
+    /// Write the current snapshot through the host, which owns where a
+    /// transcript lives and never fails the child over it.
+    fn persist(&self) {
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.host
+            .persist(&self.parent, self.id, &self.label, &history);
+    }
+
+    /// Append a message the child's provider never saw — what the child was
+    /// doing when it stopped.
+    fn note(&self, msg: ChatMessage) {
+        self.history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(msg);
+    }
+
+    /// Replace the mirror with the history the child is about to send.
+    fn snapshot(&self, messages: &[ChatMessage]) {
+        *self.history.lock().unwrap_or_else(|e| e.into_inner()) = messages.to_vec();
+    }
+}
+
+/// The child engine's provider, wrapped so each request records the history it
+/// is about to run on. The request itself is forwarded untouched.
+struct SnapshotProvider {
+    inner: Arc<dyn LlmProvider>,
+    journal: Arc<ChildJournal>,
+}
+
+#[async_trait::async_trait]
+impl LlmProvider for SnapshotProvider {
+    fn id(&self) -> &'static str {
+        self.inner.id()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn native_tool_calls(&self) -> bool {
+        self.inner.native_tool_calls()
+    }
+
+    async fn chat_stream(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        tools: Option<serde_json::Value>,
+        temperature: f32,
+        reasoning_effort: Option<&str>,
+        params: &ModelParams,
+    ) -> anyhow::Result<BoxStream<StreamChunk>> {
+        self.journal.snapshot(messages);
+        self.inner
+            .chat_stream(model, messages, tools, temperature, reasoning_effort, params)
+            .await
+    }
+}
+
 /// One live child, kept process-wide by id. The task it runs in owns the
 /// engine; the parent side holds only these handles, so a child can outlive the
 /// tool call that started it.
@@ -383,6 +463,9 @@ struct ChildHandle {
     /// The parent session that owns it — a foreign session may not answer it.
     session: i64,
     card: ChildCard,
+    /// The child's own history mirror: an abort persists from here, because the
+    /// aborted task never runs its tail.
+    journal: Arc<ChildJournal>,
     /// The parent's read end, cloned out of the map so no registry lock is held
     /// while a parent parks on it.
     outcomes: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ChildOutcome>>>,
@@ -414,6 +497,7 @@ fn register_child(
     session: i64,
     id: u64,
     card: ChildCard,
+    journal: Arc<ChildJournal>,
     tx: tokio::sync::mpsc::Sender<ChildOutcome>,
     rx: tokio::sync::mpsc::Receiver<ChildOutcome>,
 ) -> (ChildRef, Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>) {
@@ -423,6 +507,7 @@ fn register_child(
     let handle = ChildHandle {
         session,
         card: card.clone(),
+        journal,
         outcomes: outcomes.clone(),
         outcomes_tx: tx.clone(),
         pending: pending.clone(),
@@ -482,6 +567,9 @@ fn abort_child(session: i64, id: u64) {
         }
     };
     if let Some(handle) = handle {
+        // The abort drops the child's turn future, so this is the last chance
+        // its history has to reach disk.
+        handle.journal.persist();
         let abort = handle.abort.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(abort) = abort {
             abort.abort();
@@ -796,12 +884,22 @@ impl SubagentSpawner {
         // and `answer_child` picks the thread up on a later parent turn.
         let (outcome_tx, outcome_rx) = tokio::sync::mpsc::channel(CHILD_OUTCOME_CAP);
         let card = ChildCard::arm(parent_ctx.clone(), child_id, label.to_string());
+        // The child's history mirror, live before its first instruction: a child
+        // that parks or is cancelled has no other write of its own.
+        let journal = Arc::new(ChildJournal {
+            history: std::sync::Mutex::new(Vec::new()),
+            host: self.host.clone(),
+            parent: parent_ctx.clone(),
+            id: child_id,
+            label: label.to_string(),
+        });
         // Registered before the task starts: the child has to find itself (and
         // its parent has to find it) from its very first instruction.
         let (child, abort) = register_child(
             owner,
             child_id,
             card.clone(),
+            journal.clone(),
             outcome_tx.clone(),
             outcome_rx,
         );
@@ -842,6 +940,9 @@ impl SubagentSpawner {
             id: child_id,
             outcomes: outcome_tx.clone(),
         }));
+        // How `ask_parent` reaches the same mirror the registry entry holds, so a
+        // question is on disk before the child parks on its answer.
+        child_ctx.ext.insert(journal.clone());
         // Either side can ask for read-only; the manifest cannot grant write back.
         let base = if readonly || spec.readonly {
             self.registry_readonly.clone()
@@ -877,8 +978,14 @@ impl SubagentSpawner {
         // child's own context — the factory installs the child's contract
         // controllers as part of that, so it needs the ctx mutable.
         let policy = (self.policy)(&mut child_ctx);
+        // The child's provider records the history of every request behind it, so
+        // the mirror always holds what the child was last running on.
+        let provider: Arc<dyn LlmProvider> = Arc::new(SnapshotProvider {
+            inner: route.provider,
+            journal: journal.clone(),
+        });
         let mut engine = Engine::new(
-            route.provider,
+            provider,
             registry,
             Arc::new(child_ctx),
             route.model,
@@ -1338,6 +1445,12 @@ async fn ask_parent_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, To
     let me = ctx.ext.get::<ChildIdentity>().ok_or_else(|| {
         ToolError::Failed("ask_parent is only available inside a delegated subagent".into())
     })?;
+    // On disk before the wait: a child parked here may only ever be cancelled
+    // afterwards, and the question is what it stopped on.
+    if let Some(journal) = ctx.ext.get::<ChildJournal>() {
+        journal.note(ChatMessage::assistant(format!("[ask_parent] {question}")));
+        journal.persist();
+    }
     let answer = park_and_wait(me.id, question.to_string(), ctx.cancel.clone())
         .await
         .map_err(ToolError::Failed)?;
