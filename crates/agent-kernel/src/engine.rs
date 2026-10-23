@@ -115,7 +115,9 @@ async fn until_cancelled<F: std::future::Future>(
 /// Per-turn outcome handed back to `SessionActor`.
 #[derive(Debug)]
 pub struct TurnOutcome {
-    /// Final assistant text (concatenated content deltas).
+    /// The turn's answer: the text of the round that ended the turn, after
+    /// the response hooks rewrote it — the reply the user read, never the
+    /// narration of the tool rounds that led up to it.
     pub text: String,
     /// Usage from the last `Done` chunk.
     /// (prompt, completion, cached) — cached ⊂ prompt.
@@ -740,6 +742,9 @@ impl Engine {
 
         // The per-round sanitize + compaction check below own both the
         // turn-start pass and every mid-turn tool round (one code path).
+
+        // Every round's text in order — the fallback for a closing round that
+        // streamed nothing, so the turn still answers with what it said.
         let mut text = String::new();
         let mut usage = None;
         let mut tool_calls_run = 0usize;
@@ -1177,12 +1182,15 @@ impl Engine {
                     duration_ms: reasoning_ms,
                 });
                 self.set_state(io, AgentState::Finished);
-                let _ = io.ui_tx.send(UiEvent::AssistantMessage(final_text));
+                let _ = io.ui_tx.send(UiEvent::AssistantMessage(final_text.clone()));
                 for effect in after_final {
                     land_effect(effect, history, io);
                 }
+                // The outcome carries the answer the user just read — the
+                // accumulated `text` only ever fed the empty-round fallback
+                // above, so a caller must not read it as the reply.
                 return Ok(TurnOutcome {
-                    text,
+                    text: final_text,
                     usage,
                     tool_calls_run,
                     steers: self.steers_this_turn.clone(),
