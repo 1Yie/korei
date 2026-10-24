@@ -245,6 +245,11 @@ pub struct Review {
     /// card shows, and the call's primary locator in the UI. `None` = the
     /// engine derives a generic one from the arguments.
     pub summary: Option<String>,
+    /// The call cannot run whatever the user answers — the tool already knows
+    /// why. The engine records this as the result instead of showing a card:
+    /// asking for permission to do something that will then be refused spends
+    /// the user's attention on a decision that changes nothing.
+    pub deny: Option<String>,
     /// The call's sub-action, when the tool has actions the gate treats
     /// differently (a desktop tool's `launch` vs a `click`). Opaque to the
     /// engine; handed to the gate's per-tool policy.
