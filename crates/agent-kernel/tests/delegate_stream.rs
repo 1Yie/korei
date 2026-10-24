@@ -59,6 +59,35 @@ async fn nested_events_carry_the_child_id() {
     }
 }
 
+/// The card's task text is the whole task, not a preview cut to fit the card.
+#[tokio::test]
+async fn the_card_carries_the_whole_task() {
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.script_text("done");
+    let (sink, mut rx) = UiSink::channel();
+    let mut ctx = ToolCtx::new();
+    ctx.install_subagent(spawner(provider));
+    ctx.install_ui(sink);
+
+    let task = "检查鉴权中间件的每一个分支，确认没有遗漏的错误路径。".repeat(6);
+    (spec().exec)(serde_json::json!({"task": task}), Arc::new(ctx))
+        .await
+        .expect("the child must finish");
+
+    let mut preview = None;
+    while let Some(ev) = rx.try_recv() {
+        if let UiEvent::ToolCallStarted {
+            child_id: Some(_),
+            args_preview,
+            ..
+        } = ev
+        {
+            preview = Some(args_preview);
+        }
+    }
+    assert_eq!(preview.as_deref(), Some(task.as_str()));
+}
+
 /// A cancel drops the child's run future mid-poll. The card it already opened
 /// must still close as an interruption rather than stay open for good.
 #[tokio::test]

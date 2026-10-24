@@ -57,6 +57,15 @@ const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// call itself — a UI that never answers must not park the turn forever.
 const DEFAULT_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Correlation id for an approval card. Process-wide rather than per engine:
+/// a delegated child paints its card on the parent's stream, so the click
+/// arrives at the parent's session and only a shared id space tells the two
+/// engines' requests apart.
+fn next_request_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How an approval wait ended. A cancel, a timeout and a deliberate refusal
 /// are three different things: only the last one is the user's decision.
 enum DecisionWait {
@@ -232,8 +241,6 @@ pub struct Engine {
     /// `request_id` correlates a verdict to its `ApprovalRequested`; stale
     /// ids are ignored instead of approving a different tool (P1-a).
     decision: Arc<std::sync::Mutex<Option<(u64, crate::tools::registry::ToolVerdict)>>>,
-    /// Monotone id source for `ApprovalRequested` correlation.
-    next_request_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Context window for the active model — compaction triggers at
     /// `compact_at` × window (user-settable: 70/80/90%).
     context_window: usize,
@@ -303,7 +310,6 @@ impl Engine {
                 "default",
             ))),
             decision: Arc::new(std::sync::Mutex::new(None)),
-            next_request_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             context_window: 256_000,
             compact_at: crate::compaction::COMPACT_AT,
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT,
@@ -505,6 +511,13 @@ impl Engine {
         }
     }
 
+    /// Adopt a gate the host already shares. The subagent spawner reads the
+    /// same slot, so a mode switch mid-run reaches live children instead of
+    /// leaving them on the mode they were born with.
+    pub fn set_permissions_shared(&mut self, shared: Arc<std::sync::RwLock<PermissionGate>>) {
+        self.permissions = shared;
+    }
+
     /// Access the shared permission gate handle for direct mid-turn updates.
     pub fn permissions_writer(&self) -> Arc<std::sync::RwLock<PermissionGate>> {
         self.permissions.clone()
@@ -568,6 +581,24 @@ impl Engine {
     /// mid-`run_turn`.
     pub fn decision_slot(&self) -> Arc<std::sync::Mutex<Option<(u64, crate::tools::registry::ToolVerdict)>>> {
         self.decision.clone()
+    }
+
+    /// This engine's child id, when it runs as a delegated subagent. An
+    /// approval card for it belongs to that child's capsule, not the parent's
+    /// turn.
+    fn child_id(&self) -> Option<u64> {
+        self.ctx
+            .ext
+            .get::<crate::tools::delegate::ChildIdentity>()
+            .map(|c| c.id)
+    }
+
+    /// Make a pending card reachable from wherever the user clicks it. A child
+    /// paints its card on the parent's stream, so the verdict arrives at the
+    /// parent's session — this registers the slot it actually has to land in.
+    fn route_child_approval(&self, request_id: u64) -> Option<crate::tools::delegate::ApprovalRoute> {
+        self.child_id()
+            .map(|_| crate::tools::delegate::route_child_approval(request_id, self.decision.clone()))
     }
 
     /// `AnswerQuestion` resolves here — same bypass-the-pump pattern as
@@ -1447,6 +1478,23 @@ impl Engine {
                     });
                 let real_fuzzy = staged.as_ref().map(|r| r.fuzzy).unwrap_or(false);
 
+                // A call the tool already knows cannot run is refused here,
+                // before the card: an approval for it would change nothing, and
+                // a question with only one possible answer is noise.
+                if let Some(reason) = review.deny.take() {
+                    self.denials_this_turn.push(call.name.clone());
+                    let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                        name: call.name.clone(),
+                        ok: false,
+                        content: reason.clone(),
+                        ui_type: None,
+                        parent: None,
+                        child_id: None,
+                    });
+                    history.push(ChatMessage::tool_result_err(call.id.clone(), reason));
+                    continue;
+                }
+
                 let action = review.action.take();
                 let decision = {
                     let gate = self.permissions.read().unwrap_or_else(|e| e.into_inner());
@@ -1520,9 +1568,8 @@ impl Engine {
                         // decision_slot(). P1-a: a fresh request_id ties
                         // this pending approval to its verdict — a stale
                         // decision can't approve this tool.
-                        let request_id = self
-                            .next_request_id
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let request_id = next_request_id();
+                        let _route = self.route_child_approval(request_id);
                         self.set_state(
                             io,
                             AgentState::AwaitingToolConfirmation {
@@ -1538,6 +1585,7 @@ impl Engine {
                             diff: real_diff.clone(),
                             fuzzy: real_fuzzy,
                             actions: Vec::new(),
+                            child_id: self.child_id(),
                         });
                         let wait = self.wait_for_decision(request_id, &io.cancel).await;
                         self.set_state(
@@ -1592,7 +1640,10 @@ impl Engine {
                                 );
                                 let _ = io
                                     .ui_tx
-                                    .send(UiEvent::ApprovalTimedOut { request_id });
+                                    .send(UiEvent::ApprovalTimedOut {
+                                        request_id,
+                                        child_id: self.child_id(),
+                                    });
                                 let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
                                     name: call.name.clone(),
                                     ok: false,
@@ -2132,9 +2183,8 @@ impl Engine {
         // directory that would be granted (and how far), then the path that
         // was refused.
         let diff = format!("关联目录：{grant_dir}（{scope_word}）\n被拒绝的路径：{path}");
-        let request_id = self
-            .next_request_id
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let request_id = next_request_id();
+        let _route = self.route_child_approval(request_id);
         self.set_state(
             io,
             AgentState::AwaitingToolConfirmation {
@@ -2148,6 +2198,7 @@ impl Engine {
             diff,
             fuzzy: false,
             actions,
+            child_id: self.child_id(),
         });
         let wait = self.wait_for_decision(request_id, &io.cancel).await;
         self.set_state(
@@ -2162,7 +2213,10 @@ impl Engine {
                 return Err(format!("access grant for {path} was cancelled"));
             }
             DecisionWait::TimedOut => {
-                let _ = io.ui_tx.send(UiEvent::ApprovalTimedOut { request_id });
+                let _ = io.ui_tx.send(UiEvent::ApprovalTimedOut {
+                    request_id,
+                    child_id: self.child_id(),
+                });
                 return Err(format!(
                     "[approval timeout] access to {path} was not granted: the user did not \
                      respond within {}s, so the request was automatically denied.",

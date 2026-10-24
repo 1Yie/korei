@@ -110,7 +110,7 @@ pub trait ToolPolicy: Send + Sync {
 }
 
 /// Rule sets — `deny` always wins, then `ask`, then `allow`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct PermissionRules {
     /// Tool names that never run (e.g. `"bash"`, `"fuzzy_patch"`).
     pub deny: HashSet<String>,
@@ -128,6 +128,10 @@ pub struct PermissionGate {
     /// Subagent context: nothing answers `Ask`, so escalations deny
     /// outright and the refusal is reported back to the child model.
     headless: bool,
+    /// Names the user granted with "本会话允许" — kept apart from `rules.allow`
+    /// because a delegated child inherits the configured rules but not a click
+    /// that covered one turn.
+    session_grants: std::collections::HashSet<String>,
 }
 
 impl PermissionGate {
@@ -137,6 +141,7 @@ impl PermissionGate {
             rules,
             policies: Default::default(),
             headless: false,
+            session_grants: Default::default(),
         }
     }
 
@@ -149,6 +154,36 @@ impl PermissionGate {
             rules: PermissionRules::default(),
             policies: Default::default(),
             headless: true,
+            session_grants: Default::default(),
+        }
+    }
+
+    /// Gate for a delegated child: the parent's own mode and rules, so a child
+    /// is bounded exactly like the turn that spawned it instead of by a
+    /// separate policy nobody chose. Two differences, both deliberate:
+    ///
+    /// - The user's "本会话允许" clicks stay with the parent. They answered one
+    ///   task, and a child is a different one.
+    /// - `bypass` drops to `auto`. A child works unwatched; an unconditional
+    ///   yes is the one mode that must not travel with it.
+    ///
+    /// `can_ask` says whether an escalation can still reach the user: when it
+    /// can, a child pauses on a real card instead of denying.
+    pub fn child_of(parent: &PermissionGate, can_ask: bool) -> Self {
+        let mut rules = parent.rules.clone();
+        for granted in &parent.session_grants {
+            rules.allow.remove(granted);
+        }
+        Self {
+            mode: if parent.mode == PermissionMode::Bypass {
+                PermissionMode::Auto
+            } else {
+                parent.mode
+            },
+            rules,
+            policies: parent.policies.clone(),
+            headless: !can_ask,
+            session_grants: Default::default(),
         }
     }
 
@@ -234,6 +269,7 @@ impl PermissionGate {
     /// this gate, dies with the actor, and never changes persistent config.
     pub fn allow_tool_for_session(&mut self, tool_name: &str) {
         self.rules.allow.insert(tool_name.to_string());
+        self.session_grants.insert(tool_name.to_string());
     }
 
     /// Drop every grant a tool has: the tool itself and any allow rule its
@@ -243,6 +279,7 @@ impl PermissionGate {
     /// asked next.
     pub fn revoke_grants(&mut self, tool_name: &str) -> bool {
         let was = self.rules.allow.remove(tool_name);
+        self.session_grants.remove(tool_name);
         if let Some(policy) = self.policies.get(tool_name) {
             for rule in policy.grants() {
                 self.rules.allow.remove(&rule);
@@ -257,6 +294,7 @@ impl PermissionGate {
     /// arriving after the actor dropped the entry some other way.
     pub fn revoke_tool_for_session(&mut self, tool_name: &str) {
         self.rules.allow.remove(tool_name);
+        self.session_grants.remove(tool_name);
     }
 
     /// Decide one tool call. `tool_name` + `is_readonly` come from the
@@ -391,6 +429,68 @@ mod tests {
 
     fn gate(mode: &str) -> PermissionGate {
         PermissionGate::from_mode_str(mode)
+    }
+
+    /// A child answers to the parent's rules, so a project that denies `bash`
+    /// still denies it one level down — the old fixed `auto` baseline quietly
+    /// allowed what the session had forbidden.
+    #[test]
+    fn a_child_inherits_the_parents_mode_and_rules() {
+        let mut rules = PermissionRules::default();
+        rules.deny.insert("bash".into());
+        let parent = PermissionGate::new(PermissionMode::Default, rules);
+        let child = PermissionGate::child_of(&parent, true);
+        assert!(matches!(
+            child.decide("bash", None, false, CallRisk::Normal, ""),
+            Decision::Deny { .. }
+        ));
+        // The mode travels too: `default` asks for a write in the child just
+        // as it does in the parent.
+        assert!(matches!(
+            child.decide("fuzzy_patch", None, false, CallRisk::Normal, ""),
+            Decision::Ask { .. }
+        ));
+    }
+
+    /// "本会话允许" answered one task. A child is a different task, so the
+    /// click does not travel with it — but a rule the project configured does.
+    #[test]
+    fn a_child_does_not_inherit_a_click_but_does_inherit_a_configured_allow() {
+        let mut parent = PermissionGate::new(PermissionMode::Default, PermissionRules::default());
+        parent.allow_tool_for_session("bash");
+        assert_eq!(
+            parent.decide("bash", None, false, CallRisk::Normal, ""),
+            Decision::Allow
+        );
+        let child = PermissionGate::child_of(&parent, true);
+        assert!(matches!(
+            child.decide("bash", None, false, CallRisk::Normal, ""),
+            Decision::Ask { .. }
+        ));
+
+        let mut rules = PermissionRules::default();
+        rules.allow.insert("bash".into());
+        let configured = PermissionGate::new(PermissionMode::Default, rules);
+        let child = PermissionGate::child_of(&configured, true);
+        assert_eq!(
+            child.decide("bash", None, false, CallRisk::Normal, ""),
+            Decision::Allow
+        );
+    }
+
+    /// A child pauses on a question only when the answer can reach it; a
+    /// headless run denies instead of parking on a card nobody will see.
+    #[test]
+    fn a_child_asks_only_when_the_user_can_answer() {
+        let parent = PermissionGate::new(PermissionMode::Default, PermissionRules::default());
+        assert!(matches!(
+            PermissionGate::child_of(&parent, true).decide("bash", None, false, CallRisk::Normal, ""),
+            Decision::Ask { .. }
+        ));
+        assert!(matches!(
+            PermissionGate::child_of(&parent, false).decide("bash", None, false, CallRisk::Normal, ""),
+            Decision::Deny { .. }
+        ));
     }
 
     struct AskPolicy;

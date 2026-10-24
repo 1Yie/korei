@@ -182,3 +182,86 @@ async fn answering_an_unknown_child_errors() {
         "{err}"
     );
 }
+
+/// One child of a parallel batch asks while its sibling is still working: the
+/// batch hands the question back at once instead of waiting on the sibling,
+/// the parent can answer it meanwhile, and the sibling's report arrives later
+/// through the context's child notifier.
+#[tokio::test]
+async fn a_question_in_a_batch_returns_without_waiting_on_siblings() {
+    let provider = Arc::new(ScriptedProvider::new());
+    // The gate holds whichever child samples first; the other one asks.
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *provider.gate.lock().unwrap() = Some(gate.clone());
+    child_asks(&provider, "which crate should I use?");
+    provider.script_text("asker adopted korei");
+    provider.script_text("sibling report");
+    let (notice_tx, mut notices) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut ctx = ToolCtx::new();
+    ctx.install_subagent(spawner(provider.clone()));
+    agent_kernel::tools::delegate::install_child_notifier(&mut ctx, move |text| {
+        let _ = notice_tx.send(text);
+    });
+    let ctx = Arc::new(ctx);
+
+    let delegate = agent_kernel::tools::delegate::spec();
+    let batch = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        (delegate.exec)(
+            serde_json::json!({ "tasks": ["a", "b"], "readonly": true }),
+            ctx.clone(),
+        ),
+    )
+    .await
+    .expect("a question must not wait on a sibling still running")
+    .expect("asking is not an error");
+    let report = &batch.content;
+    assert!(report.contains("1 waiting, 1 running"), "{report}");
+    assert!(report.contains("] waiting ·"), "{report}");
+    assert!(report.contains("] running ──"), "{report}");
+    assert!(report.contains("which crate should I use?"), "{report}");
+    let waiting_at = report.find("] waiting ·").expect("the asker's section");
+    let asker = child_id_of(&report[waiting_at..]);
+
+    let answer = ToolRegistry::with_builtins()
+        .spec("answer_child")
+        .expect("the parent holds answer_child");
+    let resumed = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        (answer.exec)(
+            serde_json::json!({ "child_id": asker, "answer": "use korei" }),
+            ctx,
+        ),
+    )
+    .await
+    .expect("the asker resumes while its sibling is still held")
+    .expect("the asker finished cleanly");
+    assert!(resumed.content.contains("asker adopted korei"), "{}", resumed.content);
+    assert!(notices.try_recv().is_err(), "the sibling is still held");
+
+    gate.notify_one();
+    let notice = tokio::time::timeout(std::time::Duration::from_secs(5), notices.recv())
+        .await
+        .expect("the detached sibling must report")
+        .expect("the notifier stays installed");
+    assert!(notice.contains("finished in the background"), "{notice}");
+    assert!(notice.contains("sibling report"), "{notice}");
+}
+
+/// A reserved floor moves the next child id past it, so a new process never
+/// reissues an id an older one already persisted.
+#[tokio::test]
+async fn reserved_ids_are_never_reissued() {
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.script_text("done");
+    let mut ctx = ToolCtx::new();
+    ctx.install_subagent(spawner(provider));
+    agent_kernel::tools::delegate::reserve_child_ids(5_000_000);
+    let report = (agent_kernel::tools::delegate::spec().exec)(
+        serde_json::json!({ "task": "go" }),
+        Arc::new(ctx),
+    )
+    .await
+    .expect("the child finishes");
+    assert!(child_id_of(&report.content) > 5_000_000, "{}", report.content);
+}
