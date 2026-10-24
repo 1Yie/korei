@@ -198,11 +198,21 @@ pub enum UiEvent {
         /// the absent field as empty.
         #[serde(default)]
         actions: Vec<ApprovalAction>,
+        /// The delegated child that asked, when the card belongs to one. The
+        /// child paints its card on the parent's stream, so without this the
+        /// click has no way to name whose turn is parked. Absent = the
+        /// session's own turn.
+        #[serde(default)]
+        child_id: Option<u64>,
     },
     /// The approval card's deadline expired unanswered — the request was
     /// denied automatically (`ToolCallFinished` carries the result). The UI
     /// marks the card as timed out so a late click can't look meaningful.
-    ApprovalTimedOut { request_id: u64 },
+    ApprovalTimedOut {
+        request_id: u64,
+        #[serde(default)]
+        child_id: Option<u64>,
+    },
     /// Final assistant text for the turn (complete, post-streaming).
     AssistantMessage(String),
     /// The session's tool whitelist just gained `tool_name` — emitted when
