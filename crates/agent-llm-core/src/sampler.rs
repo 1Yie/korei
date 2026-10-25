@@ -309,29 +309,30 @@ impl Sampler {
 
         loop {
             // Wait for the next chunk in short ticks so the caller can flush
-            // text it is still holding while the stream is quiet; the overall
-            // idle ceiling is unchanged.
-            let idle_since = tokio::time::Instant::now();
-            let next = loop {
+            // text it is still holding while the stream is quiet. The idle
+            // ceiling counts from the last sign of life: content, or a
+            // `Keepalive` — an upstream that is silently thinking.
+            let mut idle_since = tokio::time::Instant::now();
+            let chunk = loop {
                 let remaining = IDLE_TIMEOUT.saturating_sub(idle_since.elapsed());
                 if remaining.is_zero() {
-                    break Err(());
+                    return Err(SampleError::IdleTimeout);
                 }
                 match tokio::time::timeout(IDLE_TICK.min(remaining), stream.next()).await {
-                    Ok(item) => break Ok(item),
                     Err(_) => on_idle(),
+                    Ok(None) => break None,
+                    Ok(Some(Err(e))) => {
+                        let msg = e.to_string();
+                        let err = classify_transport_error(&msg);
+                        return Err(err);
+                    }
+                    Ok(Some(Ok(StreamChunk::Keepalive))) => {
+                        idle_since = tokio::time::Instant::now();
+                    }
+                    Ok(Some(Ok(c))) => break Some(c),
                 }
             };
-            let chunk = match next {
-                Err(_) => return Err(SampleError::IdleTimeout),
-                Ok(None) => break,
-                Ok(Some(Err(e))) => {
-                    let msg = e.to_string();
-                    let err = classify_transport_error(&msg);
-                    return Err(err);
-                }
-                Ok(Some(Ok(c))) => c,
-            };
+            let Some(chunk) = chunk else { break };
 
             if let StreamChunk::Done { .. } = &chunk {
                 if done_seen {
@@ -653,6 +654,104 @@ mod tests {
 
     fn stream_err(msg: &str) -> anyhow::Result<StreamChunk> {
         Err(anyhow::anyhow!(msg.to_string()))
+    }
+
+    /// A model that thinks silently for longer than the idle ceiling keeps the
+    /// stream alive with `Keepalive`; the sampler must not call it wedged, and
+    /// must not hand the marker on as if it were output.
+    #[tokio::test(start_paused = true)]
+    async fn keepalive_outlasts_the_idle_ceiling_and_is_not_forwarded() {
+        let pings = (IDLE_TIMEOUT.as_secs() / 60 + 2) as usize;
+        let slow = futures::stream::unfold(0usize, move |n| async move {
+            if n < pings {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Some((Ok(StreamChunk::Keepalive), n + 1))
+            } else if n == pings {
+                Some((Ok(StreamChunk::ContentDelta("answer".into())), n + 1))
+            } else if n == pings + 1 {
+                Some((Ok(done_chunk()), n + 1))
+            } else {
+                None
+            }
+        });
+        let p = Arc::new(StreamingProvider(std::sync::Mutex::new(Some(Box::pin(
+            slow,
+        )))));
+        let sampler = Sampler::new(p);
+
+        let mut seen: Vec<StreamChunk> = Vec::new();
+        let started = tokio::time::Instant::now();
+        sampler
+            .sample(req(), &[], |c| seen.push(c.clone()), |_| {}, || {})
+            .await
+            .expect("a silent model with a live connection must not time out");
+
+        assert!(
+            started.elapsed() > IDLE_TIMEOUT,
+            "the test must outlast the ceiling"
+        );
+        assert!(!seen.contains(&StreamChunk::Keepalive), "{seen:?}");
+        assert!(
+            matches!(&seen[0], StreamChunk::ContentDelta(t) if t == "answer"),
+            "{seen:?}"
+        );
+        assert!(
+            matches!(seen.last(), Some(StreamChunk::Done { .. })),
+            "{seen:?}"
+        );
+    }
+
+    /// No sign of life at all still trips the ceiling.
+    #[tokio::test(start_paused = true)]
+    async fn silence_without_keepalive_still_times_out() {
+        let dead = futures::stream::pending::<anyhow::Result<StreamChunk>>();
+        let p = Arc::new(StreamingProvider(std::sync::Mutex::new(Some(Box::pin(
+            dead,
+        )))));
+        let sampler = Sampler::new(p);
+
+        let err = sampler
+            .sample(req(), &[], |_| {}, |_| {}, || {})
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SampleError::IdleTimeout | SampleError::Exhausted { .. }
+            ),
+            "{err:?}"
+        );
+    }
+
+    fn done_chunk() -> StreamChunk {
+        StreamChunk::Done {
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_tokens: None,
+        }
+    }
+
+    /// Hands out one prepared stream; any retry after it gets a silent one.
+    struct StreamingProvider(std::sync::Mutex<Option<BoxStream<StreamChunk>>>);
+
+    #[async_trait]
+    impl LlmProvider for StreamingProvider {
+        fn id(&self) -> &'static str {
+            "streaming"
+        }
+
+        async fn chat_stream(
+            &self,
+            _model: &str,
+            _messages: &[ChatMessage],
+            _tools: Option<serde_json::Value>,
+            _temperature: f32,
+            _reasoning_effort: Option<&str>,
+            _params: &ModelParams,
+        ) -> anyhow::Result<BoxStream<StreamChunk>> {
+            let prepared = self.0.lock().unwrap().take();
+            Ok(prepared.unwrap_or_else(|| Box::pin(futures::stream::pending())))
+        }
     }
 
     /// The resolved key must never reach the provider in clear text, even when

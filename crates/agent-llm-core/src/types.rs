@@ -629,6 +629,12 @@ pub enum StreamChunk {
         cached_tokens: Option<u32>,
     },
     Error(String),
+    /// The upstream is alive but has produced nothing to show — a keep-alive
+    /// ping, an SSE comment, an event the provider does not surface. It carries
+    /// no content and is not output: the sampler uses it to restart its idle
+    /// clock and never forwards it, so a model that thinks silently for minutes
+    /// is not mistaken for a wedged stream.
+    Keepalive,
 }
 
 /// Assemble a completed tool call list from a chunk stream — used by the

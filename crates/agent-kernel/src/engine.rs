@@ -1015,6 +1015,7 @@ impl Engine {
                                     });
                                 }
                             }
+                            StreamChunk::Keepalive => {}
                             StreamChunk::Error(e) => {
                                 stream_error = Some(e.clone());
                                 if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_text(true) {
