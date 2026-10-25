@@ -873,9 +873,9 @@ impl Engine {
             let mut saw_done = false;
             // Delta coalescing — the UI doesn't need one event per SSE
             // chunk (often 1-5 chars). Buffer text/reasoning deltas and
-            // flush at ~120 bytes, after 40ms, or on any non-delta chunk so the
-            // bounded UI channel never sees a per-token burst large
-            // enough to push out control events via try_send.
+            // flush at ~120 bytes or after 40ms, and always flush the other
+            // side when the stream switches content type (or starts a tool
+            // call) so the UI sees the blocks in stream order.
             // Shared by the chunk callback and the idle tick, hence the lock (the
             // boxed future must be Send; it is never contended).
             let coalesce = std::sync::Mutex::new(DeltaBuffers::new());
@@ -945,14 +945,19 @@ impl Engine {
                         }
                         match chunk {
                             StreamChunk::ReasoningDelta(t) => {
+                                // Text is over once reasoning starts: flush it first.
+                                let mut c = coalesce.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(text) = c.take_text(true) {
+                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None, child_id: None });
+                                }
                                 round_reasoning.push_str(t);
-                                coalesce.lock().unwrap_or_else(|e| e.into_inner()).reasoning.push_str(t);
+                                c.reasoning.push_str(t);
                                 let now = agent_llm_core::types::now_ms();
                                 if reasoning_first.is_none() {
                                     reasoning_first = Some(now);
                                 }
                                 reasoning_last = now;
-                                if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_reasoning(false) {
+                                if let Some(text) = c.take_reasoning(false) {
                                     let _ = io.ui_tx.send(UiEvent::ReasoningDelta {
                                         text,
                                         parent: None,
@@ -961,13 +966,27 @@ impl Engine {
                                 }
                             }
                             StreamChunk::ContentDelta(t) => {
+                                // Reasoning is over once text starts: flush it first.
+                                let mut c = coalesce.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(text) = c.take_reasoning(true) {
+                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None, child_id: None });
+                                }
                                 round_text.push_str(t);
-                                coalesce.lock().unwrap_or_else(|e| e.into_inner()).text.push_str(t);
-                                if let Some(text) = coalesce.lock().unwrap_or_else(|e| e.into_inner()).take_text(false) {
+                                c.text.push_str(t);
+                                if let Some(text) = c.take_text(false) {
                                     let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None, child_id: None });
                                 }
                             }
                             StreamChunk::ToolCallDelta { .. } => {
+                                // A tool call's argument stream can run for seconds with
+                                // no idle tick, so the preamble must not wait for it.
+                                let mut c = coalesce.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(text) = c.take_text(true) {
+                                    let _ = io.ui_tx.send(UiEvent::TextDelta { text, parent: None, child_id: None });
+                                }
+                                if let Some(text) = c.take_reasoning(true) {
+                                    let _ = io.ui_tx.send(UiEvent::ReasoningDelta { text, parent: None, child_id: None });
+                                }
                                 assembler.feed(chunk);
                             }
                             StreamChunk::Done { prompt_tokens, completion_tokens, cached_tokens } => {
