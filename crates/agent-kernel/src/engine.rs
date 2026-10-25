@@ -579,7 +579,9 @@ impl Engine {
     /// The shared decision slot — SessionActor clones it to deliver
     /// `ToolDecision { request_id, approved }` while the engine is
     /// mid-`run_turn`.
-    pub fn decision_slot(&self) -> Arc<std::sync::Mutex<Option<(u64, crate::tools::registry::ToolVerdict)>>> {
+    pub fn decision_slot(
+        &self,
+    ) -> Arc<std::sync::Mutex<Option<(u64, crate::tools::registry::ToolVerdict)>>> {
         self.decision.clone()
     }
 
@@ -596,9 +598,13 @@ impl Engine {
     /// Make a pending card reachable from wherever the user clicks it. A child
     /// paints its card on the parent's stream, so the verdict arrives at the
     /// parent's session — this registers the slot it actually has to land in.
-    fn route_child_approval(&self, request_id: u64) -> Option<crate::tools::delegate::ApprovalRoute> {
-        self.child_id()
-            .map(|_| crate::tools::delegate::route_child_approval(request_id, self.decision.clone()))
+    fn route_child_approval(
+        &self,
+        request_id: u64,
+    ) -> Option<crate::tools::delegate::ApprovalRoute> {
+        self.child_id().map(|_| {
+            crate::tools::delegate::route_child_approval(request_id, self.decision.clone())
+        })
     }
 
     /// `AnswerQuestion` resolves here — same bypass-the-pump pattern as
@@ -865,6 +871,7 @@ impl Engine {
             // assistant row (the live stream only ever saw the coalesced
             // deltas), so a reopened session replays the same 思考过程 block.
             let mut round_reasoning = String::new();
+            let mut round_provider_state = None;
             // First/last reasoning-delta stamps — the block's true span
             // persists on the assistant row as `duration_ms` so a replayed
             // view shows the real `· 20s` instead of nothing.
@@ -935,6 +942,7 @@ impl Engine {
                         if retry_reset.swap(false, std::sync::atomic::Ordering::Relaxed) {
                             round_text.clear();
                             round_reasoning.clear();
+                            round_provider_state = None;
                             reasoning_first = None;
                             reasoning_last = 0;
                             coalesce.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1014,6 +1022,10 @@ impl Engine {
                                         cached_tokens: cached,
                                     });
                                 }
+                            }
+                            StreamChunk::ProviderState(state) => {
+                                // Adapter-owned replay data is not UI output.
+                                round_provider_state = Some(state.clone());
                             }
                             StreamChunk::Keepalive => {}
                             StreamChunk::Error(e) => {
@@ -1199,6 +1211,7 @@ impl Engine {
                             history.push(
                                 ChatMessage::assistant(final_text)
                                     .with_reasoning(Some(reasoning))
+                                    .with_provider_state(round_provider_state.take())
                                     .with_duration_ms(reasoning_ms),
                             );
                         }
@@ -1231,6 +1244,7 @@ impl Engine {
                     images: Vec::new(),
                     reasoning: Some(reasoning),
                     duration_ms: reasoning_ms,
+                    provider_state: round_provider_state.take(),
                 });
                 self.set_state(io, AgentState::Finished);
                 let _ = io.ui_tx.send(UiEvent::AssistantMessage(final_text.clone()));
@@ -1264,6 +1278,7 @@ impl Engine {
                 images: Vec::new(),
                 reasoning: Some(reasoning),
                 duration_ms: reasoning_ms,
+                provider_state: round_provider_state.take(),
             });
 
             tool_rounds += 1;
@@ -1443,17 +1458,10 @@ impl Engine {
                             // refusal the host can lift becomes a question —
                             // and one grant makes the same call go through.
                             let retried = match &e {
-                                agent_tool::ToolError::OutOfScope { path, suggestion } => {
-                                    Some(
-                                        self.ask_scope_grant(
-                                            io,
-                                            call,
-                                            path,
-                                            suggestion.as_deref(),
-                                        )
+                                agent_tool::ToolError::OutOfScope { path, suggestion } => Some(
+                                    self.ask_scope_grant(io, call, path, suggestion.as_deref())
                                         .await,
-                                    )
-                                }
+                                ),
                                 _ => None,
                             };
                             let outcome = match retried {
@@ -1477,7 +1485,8 @@ impl Engine {
                                         parent: None,
                                         child_id: None,
                                     });
-                                    history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
+                                    history
+                                        .push(ChatMessage::tool_result_err(call.id.clone(), msg));
                                     continue;
                                 }
                             }
@@ -1617,8 +1626,7 @@ impl Engine {
                         match wait {
                             DecisionWait::Verdict(v) if v.approved => {}
                             DecisionWait::Verdict(_) => {
-                                let msg =
-                                    format!("user denied {call_name}", call_name = call.name);
+                                let msg = format!("user denied {call_name}", call_name = call.name);
                                 self.denials_this_turn.push(call.name.clone());
                                 let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
                                     name: call.name.clone(),
@@ -1658,12 +1666,10 @@ impl Engine {
                                     &crate::tools::host_slots::secs_label(self.approval_timeout),
                                     false,
                                 );
-                                let _ = io
-                                    .ui_tx
-                                    .send(UiEvent::ApprovalTimedOut {
-                                        request_id,
-                                        child_id: self.child_id(),
-                                    });
+                                let _ = io.ui_tx.send(UiEvent::ApprovalTimedOut {
+                                    request_id,
+                                    child_id: self.child_id(),
+                                });
                                 let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
                                     name: call.name.clone(),
                                     ok: false,
@@ -1756,9 +1762,7 @@ impl Engine {
                     // there). Racing it here would drop that text for a
                     // generic line, and the UI could no longer tie the card
                     // to the child's transcript.
-                    let cancel_aware = registry
-                        .spec(&call.name)
-                        .is_some_and(|s| s.cancel_aware);
+                    let cancel_aware = registry.spec(&call.name).is_some_and(|s| s.cancel_aware);
                     let dispatched = if cancel_aware {
                         self.active_registry()
                             .dispatch(&call.name, args.clone(), self.ctx.clone())
@@ -1769,8 +1773,11 @@ impl Engine {
                         // now, not after the tool's own timeout.
                         let Some(dispatched) = until_cancelled(
                             &io.cancel,
-                            self.active_registry()
-                                .dispatch(&call.name, args.clone(), self.ctx.clone()),
+                            self.active_registry().dispatch(
+                                &call.name,
+                                args.clone(),
+                                self.ctx.clone(),
+                            ),
                         )
                         .await
                         else {

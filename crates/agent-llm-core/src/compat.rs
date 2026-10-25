@@ -10,6 +10,15 @@ use serde::{Deserialize, Serialize};
 /// settings-written `config.toml` both round-trip.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProviderCompat {
+    /// Whether this model accepts temperature at all. None keeps the adapter's
+    /// existing default; false vetoes both caller hints and sampling overrides.
+    #[serde(
+        default,
+        alias = "supportsTemperature",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub supports_temperature: Option<bool>,
+
     // ---- OpenAI-compatible (openai-completions / openai-responses) ----
     /// Provider accepts the `store` request field.
     #[serde(
@@ -232,8 +241,9 @@ pub struct ProviderCompat {
         skip_serializing_if = "Option::is_none"
     )]
     pub force_adaptive_thinking: Option<bool>,
-    /// Per-turn effort system messages + thinking-binding controls
-    /// (`prefix_mismatch_behavior: "drop_block"`).
+    /// Adapter-specific per-turn effort support. Responses uses
+    /// configuration_update items; Anthropic uses its own messages/beta
+    /// controls. Declaring one does not make the other protocol valid.
     #[serde(
         default,
         alias = "supports_mid_convo_effort",
@@ -274,6 +284,7 @@ pub struct ProviderCompat {
 macro_rules! compat_fields {
     ($mac:ident) => {
         $mac! {
+            supports_temperature,
             supports_store,
             supports_developer_role,
             supports_reasoning_effort,

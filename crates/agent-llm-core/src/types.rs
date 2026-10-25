@@ -163,6 +163,26 @@ pub enum Role {
     Tool,
 }
 
+/// Opaque, replay-only state owned by an adapter, not user-visible reasoning.
+/// The kernel persists and forwards it without interpreting provider JSON.
+/// Adapters must verify both origin and model before replaying its data.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProviderState {
+    pub origin: String,
+    pub model: String,
+    pub data: String,
+}
+
+impl std::fmt::Debug for ProviderState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderState")
+            .field("origin", &self.origin)
+            .field("model", &self.model)
+            .field("data_bytes", &self.data.len())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
@@ -221,6 +241,10 @@ pub struct ChatMessage {
     /// adapter must keep it off the wire (`openai_completions` strips it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<i64>,
+    /// Adapter-owned continuity data (e.g. encrypted reasoning). Never render
+    /// it as text or send it to a different provider/model. Absent on old logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_state: Option<ProviderState>,
 }
 
 /// Wall-clock epoch millis — stamps every message at construction.
@@ -246,6 +270,11 @@ fn empty_string_as_none<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ChatMessage {
+    pub fn with_provider_state(mut self, state: Option<ProviderState>) -> Self {
+        self.provider_state = state;
+        self
+    }
+
     /// Attach this round's reasoning trace. Empty/whitespace traces are
     /// dropped rather than persisted as an empty thought block.
     pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
@@ -272,6 +301,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     pub fn user(text: impl Into<String>) -> Self {
@@ -286,6 +316,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     /// Attach staged image refs — only call this when the active model
@@ -306,6 +337,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     /// A user-facing system line the live stream emitted via
@@ -323,6 +355,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     /// A host-pushed notice — see [`NoticeKind::Host`]. Model-facing: the
@@ -346,6 +379,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     /// A `Role::User` instruction the UI never showed (injected by the
@@ -363,6 +397,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     /// Text the model sees in front of a mid-turn steer. Part of the prompt,
@@ -385,6 +420,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
 
@@ -429,6 +465,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     /// The persisted compaction card — a JSON payload (`before_tokens`,
@@ -463,6 +500,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     /// A persisted UI-only card of `kind` whose `payload` the host's frontend
@@ -479,6 +517,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     pub fn tool_result(call_id: impl Into<String>, text: impl Into<String>) -> Self {
@@ -493,6 +532,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
     /// Attach staged image refs a *tool* produced (a screenshot) — the tool
@@ -518,6 +558,7 @@ impl ChatMessage {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
 }
@@ -604,6 +645,9 @@ pub enum StreamChunk {
     /// Reasoning trace (DeepSeek-R1 `reasoning_content`, Claude thinking,
     /// Grok reasoning).
     ReasoningDelta(String),
+    /// Replay-only adapter state for a successfully completed assistant round.
+    /// Persist on its message; never render it or count it as generated text.
+    ProviderState(ProviderState),
     /// User-visible text delta.
     ContentDelta(String),
     /// Tool-call fragment — id/name arrive once, arguments stream as JSON shards under
@@ -971,6 +1015,34 @@ mod tests {
     }
 
     #[test]
+    fn opaque_provider_state_roundtrips_and_old_snapshots_stay_compatible() {
+        let state = serde_json::json!({
+            "origin": "responses-fixture",
+            "model": "fixture-gpt",
+            "data": "{\"output\":[{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque-fixture\"}]}"
+        });
+        let message: ChatMessage = serde_json::from_value(serde_json::json!({
+            "role": "assistant", "content": "answer", "provider_state": state,
+        }))
+        .unwrap();
+        let stored = serde_json::to_value(&message).unwrap();
+        assert!(
+            !format!("{message:?}").contains("opaque-fixture"),
+            "Debug output must not expose opaque replay data"
+        );
+        assert_eq!(
+            stored["provider_state"], state,
+            "provider continuity data must survive a session snapshot"
+        );
+        let old: ChatMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":"old"}"#).unwrap();
+        assert!(serde_json::to_value(old)
+            .unwrap()
+            .get("provider_state")
+            .is_none());
+    }
+
+    #[test]
     fn assembler_collapses_sparse_output_indices() {
         // Responses `output_index` counts reasoning/message items too —
         // a call at index 2 must not materialize empty slots 0 and 1.
@@ -1083,6 +1155,7 @@ mod tests {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         };
         let j = serde_json::to_string(&m).unwrap();
         assert!(j.contains(r#""content":"""#), "None must serialize as \"\"");

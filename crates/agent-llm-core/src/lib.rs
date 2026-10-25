@@ -16,4 +16,4 @@ pub use compat::ProviderCompat;
 pub use masking::EgressMasker;
 pub use provider::{BoxStream, Capabilities, LlmProvider, ModelParams, UnavailableProvider};
 pub use thinking::{available_thinking_levels, normalize_thinking_level, THINKING_LEVELS};
-pub use types::{ChatMessage, Role, StreamChunk, ToolCall};
+pub use types::{ChatMessage, ProviderState, Role, StreamChunk, ToolCall};

@@ -455,6 +455,7 @@ mod tests {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         }
     }
 
@@ -499,6 +500,7 @@ mod tests {
 
                 reasoning: None,
                 duration_ms: None,
+                provider_state: None,
             },
         ];
         // text-protocol provider → tool_calls flatten into message text on
@@ -527,6 +529,7 @@ mod tests {
 
                 reasoning: None,
                 duration_ms: None,
+                provider_state: None,
             },
         ];
         sanitize_for_sample(&mut h2, 100_000, true);
@@ -583,6 +586,7 @@ mod tests {
 
                 reasoning: None,
                 duration_ms: None,
+                provider_state: None,
             },
             {
                 let mut m = msg(Role::Tool, &"output_a ".repeat(500));
@@ -658,6 +662,7 @@ mod tests {
             images: Vec::new(),
             reasoning: None,
             duration_ms: None,
+            provider_state: None,
         });
         h.push(msg(Role::Tool, &"T".repeat(20_000))); // ≈5000 tokens ≫ 25%
 
