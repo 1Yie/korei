@@ -85,10 +85,11 @@ fn emit_child(parent_ctx: &ToolCtx, child: u64, label: &str, ok: Option<bool>, b
     let Some(ui) = parent_ctx.ui() else { return };
     let event = match ok {
         None => UiEvent::ToolCallStarted {
-            call_id: format!("child:{child}"),
             name: label.to_string(),
             parent: Some("delegate".into()),
             args_preview: task_preview(body),
+            // A child card has no queue entry of its own.
+            call_id: format!("child:{child}"),
             child_id: Some(child),
         },
         Some(ok) => UiEvent::ToolCallFinished {
@@ -324,6 +325,8 @@ struct SteerEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveChild {
     pub child_id: u64,
+    /// Started with `background: true` — its parent turn has already ended.
+    pub background: bool,
     /// The card label (`subagent`, `review #1`, …).
     pub label: String,
     /// The instruction the child was handed — the card's chip text.
@@ -360,6 +363,17 @@ pub fn reserve_child_ids(above: u64) {
 /// notice. Per context and never inherited: only the context that delegated
 /// owns the notices of its children.
 pub struct ChildNotifier(Arc<dyn Fn(String) + Send + Sync>);
+
+/// The session-level cancel flag background children run on. Installed by the
+/// host: it outlives a turn, so a turn's own cancel never reaches a background
+/// child and the session's stop action can. Without it a background child gets
+/// a flag of its own that nothing can raise.
+pub struct BackgroundCancel(pub Arc<std::sync::atomic::AtomicBool>);
+
+/// Install the flag a session's background children are stopped by.
+pub fn install_background_cancel(ctx: &mut ToolCtx, flag: Arc<std::sync::atomic::AtomicBool>) {
+    ctx.ext.insert(Arc::new(BackgroundCancel(flag)));
+}
 
 /// Install the notice hook detached children report through. Without one, a
 /// detached child still closes its card and a later question still shows in
@@ -451,6 +465,17 @@ pub fn active_children(session: i64) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// Stop every running child of `session`, returning how many were stopped. The
+/// session's cancel flag is the host's to raise; this is the manual form, used
+/// when the user stops the session outright.
+pub fn abort_children(session: i64) -> usize {
+    let ids = active_children(session);
+    for id in &ids {
+        abort_child(session, *id);
+    }
+    ids.len()
+}
+
 /// The running children owned by `session`, with the label, task and question
 /// the UI needs to redraw their cards. A reloaded webview has nothing else:
 /// the events that drew them are gone and history holds no row until the child
@@ -464,6 +489,7 @@ pub fn active_child_infos(session: i64) -> Vec<ActiveChild> {
                 .filter(|(_, h)| h.session == session)
                 .map(|(id, h)| ActiveChild {
                     child_id: *id,
+                    background: h.background,
                     label: h.card.label.clone(),
                     task: h.task.clone(),
                     waiting: h.waiting.lock().unwrap_or_else(|e| e.into_inner()).clone(),
@@ -609,6 +635,9 @@ impl LlmProvider for SnapshotProvider {
 struct ChildHandle {
     /// The parent session that owns it — a foreign session may not answer it.
     session: i64,
+    /// Started with `background: true`: it outlives the turn that spawned it and
+    /// runs on the session's cancel flag, not the turn's.
+    background: bool,
     card: ChildCard,
     /// The instruction it was handed — the chip a redrawn card shows.
     task: String,
@@ -654,6 +683,7 @@ fn register_child(
     journal: Arc<ChildJournal>,
     tx: tokio::sync::mpsc::Sender<ChildOutcome>,
     rx: tokio::sync::mpsc::Receiver<ChildOutcome>,
+    background: bool,
 ) -> (
     ChildRef,
     Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
@@ -664,6 +694,7 @@ fn register_child(
     let abort = Arc::new(std::sync::Mutex::new(None));
     let handle = ChildHandle {
         session,
+        background,
         card: card.clone(),
         task,
         journal,
@@ -1058,6 +1089,7 @@ impl SubagentSpawner {
                 spec.clone(),
                 cancel.clone(),
                 &label,
+                false,
             );
             labels.push(label);
             match started {
@@ -1144,7 +1176,7 @@ impl SubagentSpawner {
         cancel: Arc<std::sync::atomic::AtomicBool>,
         label: &str,
     ) -> Result<String, String> {
-        let started = self.start(parent_ctx, task, readonly, spec, cancel, label)?;
+        let started = self.start(parent_ctx, task, readonly, spec, cancel, label, false)?;
         match started.first().await {
             FirstOutcome::Asked(text) => Ok(text),
             FirstOutcome::Done(result) => result,
@@ -1153,6 +1185,8 @@ impl SubagentSpawner {
 
     /// Spawn one child and hand back the handle its first outcome is read
     /// through. The child is already running when this returns.
+    /// Started detached: the child outlives this call and runs on the session's
+    /// cancel flag.
     fn start(
         &self,
         parent_ctx: Arc<ToolCtx>,
@@ -1160,11 +1194,13 @@ impl SubagentSpawner {
         readonly: bool,
         // Named agent's body and tool allowlist (empty = builtin contract only).
         spec: ChildSpec,
-        // Cancellation for this child: the parent's own flag, so a user cancel
-        // reaches a child whether it is running or parked.
+        // Cancellation for this child: a user cancel must reach a child whether
+        // it is running or parked. A foreground child takes the turn's own flag;
+        // a background one takes the session's.
         cancel: Arc<std::sync::atomic::AtomicBool>,
         // Card label in the parent's stream (`review #1`, `subagent`, …).
         label: &str,
+        background: bool,
     ) -> Result<StartedChild, String> {
         // Everything the child emits goes through its own sink and is forwarded
         // into the parent's stream tagged with this child's label — so a fan-out
@@ -1200,6 +1236,7 @@ impl SubagentSpawner {
             journal.clone(),
             outcome_tx.clone(),
             outcome_rx,
+            background,
         );
         let steers = SteerGuard(child_id);
         let entry = ChildGuard(child_id);
@@ -1382,24 +1419,46 @@ impl StartedChild {
     /// parked or not — is the session's, not this wait's.
     async fn first(self) -> FirstOutcome {
         let mut guard = AwaitGuard::arm(self.owner, self.id, self.card);
-        let first = await_outcome(self.owner, self.id, &self.child, &self.cancel).await;
+        let first = first_outcome(
+            self.owner,
+            self.id,
+            &self.label,
+            &self.child,
+            &self.parent,
+            &self.cancel,
+        )
+        .await;
         guard.armed = false;
-        // The child's own turn aborts on the same flag, so which side notices
-        // first is a race. The result must not depend on it: once the flag is
-        // up this is a cancellation and says so, with the child's id.
-        if self.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-            abort_child(self.owner, self.id);
-            return FirstOutcome::Done(Err(cancel_marker(self.id)));
+        first
+    }
+}
+
+/// Wait for `id`'s next outcome and put it in the parent's terms: a parked child
+/// announces itself as waiting, a finished one is a report. The cancel is checked
+/// first — the child's own turn aborts on the same flag, so which side notices
+/// first is a race, and the result must not depend on it: a raised flag is a
+/// cancellation that names its child.
+async fn first_outcome(
+    session: i64,
+    id: u64,
+    label: &str,
+    child: &ChildRef,
+    parent: &Arc<ToolCtx>,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+) -> FirstOutcome {
+    let got = await_outcome(session, id, child, cancel).await;
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        abort_child(session, id);
+        return FirstOutcome::Done(Err(cancel_marker(id)));
+    }
+    match got {
+        Ok(ChildOutcome::Asked(question)) => {
+            emit_waiting(parent, id, label, &question);
+            FirstOutcome::Asked(waiting_text(label, id, &question))
         }
-        match first {
-            Ok(ChildOutcome::Asked(question)) => {
-                emit_waiting(&self.parent, self.id, &self.label, &question);
-                FirstOutcome::Asked(waiting_text(&self.label, self.id, &question))
-            }
-            Ok(ChildOutcome::Done { ok: true, report }) => FirstOutcome::Done(Ok(report)),
-            Ok(ChildOutcome::Done { ok: false, report }) => FirstOutcome::Done(Err(report)),
-            Err(e) => FirstOutcome::Done(Err(e)),
-        }
+        Ok(ChildOutcome::Done { ok: true, report }) => FirstOutcome::Done(Ok(report)),
+        Ok(ChildOutcome::Done { ok: false, report }) => FirstOutcome::Done(Err(report)),
+        Err(e) => FirstOutcome::Done(Err(e)),
     }
 }
 
@@ -1444,6 +1503,36 @@ fn detach(
                 // still shows among the session's active children.
                 None => tracing::debug!(child = id, "detached subagent outcome has no notifier"),
             }
+        }
+    });
+}
+
+/// Watch a child that outlived the call that answered it: its next question or
+/// report reaches its parent as a notice, the same way a detached batch sibling
+/// reports. Without this the child's outcomes channel fills and its next
+/// `ask_parent` is refused with "your parent is not listening".
+fn detach_child(
+    ctx: &Arc<ToolCtx>,
+    session: i64,
+    id: u64,
+    label: String,
+    child: ChildRef,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let notify = ctx.ext.get::<ChildNotifier>();
+    let parent = ctx.clone();
+    tokio::spawn(async move {
+        let mut guard = AwaitGuard::arm(session, id, child.card.clone());
+        let first = first_outcome(session, id, &label, &child, &parent, &cancel).await;
+        guard.armed = false;
+        let Some(text) = background_notice(&label, id, first) else {
+            return;
+        };
+        match &notify {
+            Some(notify) => (notify.0)(text),
+            // Nothing to tell: the card already closed, and the child still
+            // shows among the session's active children.
+            None => tracing::debug!(child = id, "detached subagent outcome has no notifier"),
         }
     });
 }
@@ -1591,8 +1680,8 @@ fn spawn_forwarder(
                 } => UiEvent::ToolCallStarted {
                     name,
                     args_preview,
-                    call_id,
                     parent: Some(tag.clone()),
+                    call_id,
                     child_id: Some(child_id),
                 },
                 UiEvent::ToolCallFinished {
@@ -1676,6 +1765,11 @@ struct DelegateArgs {
     /// Optional named subagent profile from the host's available catalog.
     #[serde(default)]
     agent: Option<String>,
+    /// Start it detached and return at once: the call hands back the child's id
+    /// and the question or report arrives later as a notice. A single `task`
+    /// only — a `tasks` batch already returns without waiting for its siblings.
+    #[serde(default)]
+    background: bool,
 }
 
 pub fn spec() -> ToolSpec {
@@ -1693,7 +1787,9 @@ pub fn spec() -> ToolSpec {
              A child that needs a decision mid-task calls `ask_parent`: this call then returns\n\
              early with its question and a child_id, and you answer with `answer_child`.\n\
              With `tasks`, the call returns as soon as one child asks (or when all finish);\n\
-             siblings still running keep going and their reports arrive later as notices.",
+             siblings still running keep going and their reports arrive later as notices.\n\
+             `background: true` returns at once with the child's id; its question or report\n\
+             arrives as a notice, so use it when you have other work to do meanwhile.",
         ),
         // Not readonly: the delegation act itself writes nothing, but a
         // full child may mutate state — so `default` mode asks once, and a
@@ -1755,10 +1851,25 @@ fn resolve_tasks(args: &DelegateArgs) -> Result<Vec<String>, String> {
     }
 }
 
+/// The flag a background child runs on: the session's own, installed by the
+/// host. A turn's flag would be cleared by the next turn, so it cannot be it;
+/// without a host slot nothing can raise this one.
+fn background_cancel(ctx: &ToolCtx) -> Arc<std::sync::atomic::AtomicBool> {
+    ctx.ext
+        .get::<BackgroundCancel>()
+        .map(|slot| slot.0.clone())
+        .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
 async fn exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, ToolError> {
     let parsed: DelegateArgs =
         serde_json::from_value(args).map_err(|e| ToolError::Args(e.to_string()))?;
     let tasks = resolve_tasks(&parsed).map_err(ToolError::Args)?;
+    if parsed.background && parsed.tasks.is_some() {
+        return Err(ToolError::Args(
+            "`background` takes a single `task` — a `tasks` batch already runs detached".into(),
+        ));
+    }
     if ctx.depth >= MAX_SUBAGENT_DEPTH {
         return Err(ToolError::Failed(
             "delegation depth limit reached — a subagent cannot delegate".into(),
@@ -1814,6 +1925,47 @@ async fn exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, ToolError> {
     }
     let agent_name = resolved.as_ref().map(|s| s.name.clone());
     let spec = resolved.unwrap_or_default();
+    if parsed.background {
+        let label = child_label(agent_name.as_deref(), 0, 1);
+        // A background child outlives this turn, so the turn's flag would be
+        // cleared underneath it. The session's flag is what the stop action raises.
+        let cancel = background_cancel(&ctx);
+        let started = spawner
+            .start(
+                ctx.clone(),
+                tasks[0].clone(),
+                parsed.readonly,
+                spec,
+                cancel,
+                &label,
+                true,
+            )
+            .map_err(ToolError::Failed)?;
+        let id = started.id;
+        // The card is armed by now; this is what marks it as one that outlives
+        // this turn, so the reader sees it keep running.
+        if ctx.ui().is_some() {
+            let _ = ctx.ui().map(|ui| {
+                ui.send(handoff_event(
+                    "subagent:background",
+                    id,
+                    &label,
+                    "task",
+                    tasks[0].as_str(),
+                ))
+            });
+        }
+        // The child is the session's from here: its question or report reaches
+        // this turn's parent as a notice, like a detached batch sibling.
+        let waiting = futures::stream::FuturesUnordered::new();
+        waiting.push(async move { (0usize, started.id, started.first().await) }.boxed());
+        detach(&ctx, waiting, vec![label.clone()]);
+        return Ok(ToolResult::text(format!(
+            "[subagent {label} (child_id {id}) is running in the background]\n\
+             Keep working — its question or report arrives as a notice. Answer a question \
+             with answer_child {{ child_id: {id}, background: true }}."
+        )));
+    }
     // Single-child calls inherit the parent's cancel flag; a parallel batch gets
     // its own flag so the batch can also stop on its own deadline.
     let cancel = ctx
@@ -1932,6 +2084,10 @@ struct AnswerChildArgs {
     child_id: u64,
     /// The decision or fact it asked for, as an instruction it can act on.
     answer: String,
+    /// Return as soon as the answer is delivered instead of waiting for the
+    /// child's next outcome, which then arrives as a notice.
+    #[serde(default)]
+    background: bool,
 }
 
 pub fn answer_child_spec() -> ToolSpec {
@@ -1942,7 +2098,8 @@ pub fn answer_child_spec() -> ToolSpec {
              next outcome. The child resumes with your `answer` as its `ask_parent` result;\n\
              you get either its next question (answer again the same way) or its final\n\
              report. `child_id` comes from the child's waiting notice. Only children of this\n\
-             session can be answered.",
+             session can be answered. `background: true` returns as soon as the answer is\n\
+             delivered; the child's next question or report then arrives as a notice.",
         ),
         // Not readonly: resuming a child lets it act on its own tools again.
         readonly: false,
@@ -1972,6 +2129,22 @@ async fn answer_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, 
     let child =
         deliver_answer(session, parsed.child_id, answer.to_string()).map_err(ToolError::Failed)?;
     emit_resumed(&ctx, parsed.child_id, &child.card.label, answer);
+    if parsed.background {
+        let label = child.card.label.clone();
+        detach_child(
+            &ctx,
+            session,
+            parsed.child_id,
+            label.clone(),
+            child,
+            background_cancel(&ctx),
+        );
+        return Ok(ToolResult::text(format!(
+            "[subagent {label} (child_id {}) keeps running in the background]\n\
+             Its next question or report arrives as a notice.",
+            parsed.child_id
+        )));
+    }
     let cancel = ctx
         .cancel
         .clone()
@@ -2012,6 +2185,7 @@ mod tests {
             tasks: tasks.map(|list| list.iter().map(|t| t.to_string()).collect()),
             readonly,
             agent: None,
+            background: false,
         }
     }
 
@@ -2217,6 +2391,7 @@ mod tests {
             journal,
             outcomes_tx,
             outcomes_rx,
+            false,
         );
         let _entry = ChildGuard(id);
 
