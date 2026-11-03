@@ -85,12 +85,14 @@ fn emit_child(parent_ctx: &ToolCtx, child: u64, label: &str, ok: Option<bool>, b
     let Some(ui) = parent_ctx.ui() else { return };
     let event = match ok {
         None => UiEvent::ToolCallStarted {
+            call_id: format!("child:{child}"),
             name: label.to_string(),
             parent: Some("delegate".into()),
             args_preview: task_preview(body),
             child_id: Some(child),
         },
         Some(ok) => UiEvent::ToolCallFinished {
+            call_id: format!("child:{child}"),
             name: label.to_string(),
             ok,
             content: card_body(body),
@@ -373,9 +375,8 @@ pub fn install_child_notifier(ctx: &mut ToolCtx, f: impl Fn(String) + Send + Syn
 /// waits on its own engine's slot — this table is what carries the answer
 /// across. Request ids are minted process-wide (`engine::next_request_id`), so
 /// one id can only ever name one pending card.
-static CHILD_APPROVALS: std::sync::Mutex<
-    Option<std::collections::HashMap<u64, ApprovalSlot>>,
-> = std::sync::Mutex::new(None);
+static CHILD_APPROVALS: std::sync::Mutex<Option<std::collections::HashMap<u64, ApprovalSlot>>> =
+    std::sync::Mutex::new(None);
 
 type ApprovalSlot = Arc<std::sync::Mutex<Option<(u64, crate::tools::registry::ToolVerdict)>>>;
 
@@ -413,8 +414,10 @@ pub fn deliver_child_decision(request_id: u64, approved: bool, action: Option<St
     let Some(slot) = slot else {
         return false;
     };
-    *slot.lock().unwrap_or_else(|e| e.into_inner()) =
-        Some((request_id, crate::tools::registry::ToolVerdict { approved, action }));
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+        request_id,
+        crate::tools::registry::ToolVerdict { approved, action },
+    ));
     true
 }
 
@@ -463,11 +466,7 @@ pub fn active_child_infos(session: i64) -> Vec<ActiveChild> {
                     child_id: *id,
                     label: h.card.label.clone(),
                     task: h.task.clone(),
-                    waiting: h
-                        .waiting
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone(),
+                    waiting: h.waiting.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 })
                 .collect()
         })
@@ -592,7 +591,14 @@ impl LlmProvider for SnapshotProvider {
     ) -> anyhow::Result<BoxStream<StreamChunk>> {
         self.journal.snapshot(messages);
         self.inner
-            .chat_stream(model, messages, tools, temperature, reasoning_effort, params)
+            .chat_stream(
+                model,
+                messages,
+                tools,
+                temperature,
+                reasoning_effort,
+                params,
+            )
             .await
     }
 }
@@ -648,7 +654,10 @@ fn register_child(
     journal: Arc<ChildJournal>,
     tx: tokio::sync::mpsc::Sender<ChildOutcome>,
     rx: tokio::sync::mpsc::Receiver<ChildOutcome>,
-) -> (ChildRef, Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>) {
+) -> (
+    ChildRef,
+    Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+) {
     let outcomes = Arc::new(tokio::sync::Mutex::new(rx));
     let pending = Arc::new(std::sync::Mutex::new(None));
     let waiting = Arc::new(std::sync::Mutex::new(None));
@@ -665,7 +674,9 @@ fn register_child(
         abort: abort.clone(),
     };
     let mut guard = ACTIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
-    guard.get_or_insert_with(Default::default).insert(id, handle);
+    guard
+        .get_or_insert_with(Default::default)
+        .insert(id, handle);
     (
         ChildRef {
             card,
@@ -723,7 +734,11 @@ fn abort_child(session: i64, id: u64) {
         // The abort drops the child's turn future, so this is the last chance
         // its history has to reach disk.
         handle.journal.persist();
-        let abort = handle.abort.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let abort = handle
+            .abort
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         if let Some(abort) = abort {
             abort.abort();
         }
@@ -955,10 +970,7 @@ impl SubagentSpawner {
 
     /// Run children under the parent's own gate. Without this a child keeps
     /// the fixed `auto` baseline — the pre-inheritance behaviour.
-    pub fn with_parent_gate(
-        mut self,
-        gate: Arc<std::sync::RwLock<PermissionGate>>,
-    ) -> Self {
+    pub fn with_parent_gate(mut self, gate: Arc<std::sync::RwLock<PermissionGate>>) -> Self {
         self.parent_gate = Some(gate);
         self
     }
@@ -1094,7 +1106,9 @@ impl SubagentSpawner {
                 }
                 None => {
                     running += 1;
-                    let id = ids[i].map(|id| id.to_string()).unwrap_or_else(|| "?".into());
+                    let id = ids[i]
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "?".into());
                     body.push_str(&format!(
                         "\n── [{i}] running ──\n[subagent {} (child_id {id}) is still running — \
                          its report will arrive as a notice]\n",
@@ -1479,7 +1493,13 @@ impl ChildRun {
         // (the engine holds a sink clone for as long as it lives).
         let forward_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _forward_guard = FlagOnDrop(forward_stop.clone());
-        let forwarder = spawn_forwarder(parent.ui(), sink_rx, label.clone(), id, forward_stop.clone());
+        let forwarder = spawn_forwarder(
+            parent.ui(),
+            sink_rx,
+            label.clone(),
+            id,
+            forward_stop.clone(),
+        );
         emit_child(&parent, id, &label, None, &preview);
         let start = std::time::Instant::now();
         // Attach the run's cost so the parent can budget follow-ups — opaque bare
@@ -1551,21 +1571,39 @@ fn spawn_forwarder(
                 continue;
             };
             let forwarded = match ev {
+                UiEvent::ToolCallQueued {
+                    name,
+                    args_preview,
+                    call_id,
+                    ..
+                } => UiEvent::ToolCallQueued {
+                    name,
+                    args_preview,
+                    parent: Some(tag.clone()),
+                    call_id,
+                    child_id: Some(child_id),
+                },
                 UiEvent::ToolCallStarted {
-                    name, args_preview, ..
+                    name,
+                    args_preview,
+                    call_id,
+                    ..
                 } => UiEvent::ToolCallStarted {
                     name,
                     args_preview,
+                    call_id,
                     parent: Some(tag.clone()),
                     child_id: Some(child_id),
                 },
                 UiEvent::ToolCallFinished {
+                    call_id,
                     name,
                     ok,
                     content,
                     ui_type,
                     ..
                 } => UiEvent::ToolCallFinished {
+                    call_id,
                     name,
                     ok,
                     content,
@@ -1860,7 +1898,9 @@ async fn ask_parent_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, To
     let answer = park_and_wait(me.id, question.to_string(), ctx.cancel.clone())
         .await
         .map_err(ToolError::Failed)?;
-    Ok(ToolResult::text(format!("[answer from your parent]\n{answer}")))
+    Ok(ToolResult::text(format!(
+        "[answer from your parent]\n{answer}"
+    )))
 }
 
 /// Park on the parent and wait for the answer. A cancel clears the park, so an
@@ -1929,8 +1969,8 @@ async fn answer_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, 
     // A context with no session answers as session 0 — the same rule children
     // register under, so only its own children are reachable.
     let session = ctx.session().unwrap_or(0);
-    let child = deliver_answer(session, parsed.child_id, answer.to_string())
-        .map_err(ToolError::Failed)?;
+    let child =
+        deliver_answer(session, parsed.child_id, answer.to_string()).map_err(ToolError::Failed)?;
     emit_resumed(&ctx, parsed.child_id, &child.card.label, answer);
     let cancel = ctx
         .cancel
@@ -1949,10 +1989,7 @@ async fn answer_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, 
     }
     match next {
         Ok(ChildOutcome::Done { ok: true, report }) => Ok(ToolResult::text(report)),
-        Ok(ChildOutcome::Done {
-            ok: false,
-            report,
-        }) => Err(ToolError::Failed(report)),
+        Ok(ChildOutcome::Done { ok: false, report }) => Err(ToolError::Failed(report)),
         Ok(ChildOutcome::Asked(question)) => {
             emit_waiting(&ctx, parsed.child_id, &child.card.label, &question);
             Ok(ToolResult::text(waiting_text(

@@ -57,13 +57,43 @@ const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 /// call itself — a UI that never answers must not park the turn forever.
 const DEFAULT_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
-/// Correlation id for an approval card. Process-wide rather than per engine:
-/// a delegated child paints its card on the parent's stream, so the click
-/// arrives at the parent's session and only a shared id space tells the two
-/// engines' requests apart.
-fn next_request_id() -> u64 {
+/// Process-wide correlation IDs keep parent and child UI requests distinct,
+/// including nested calls that share the parent's event stream.
+pub(crate) fn next_request_id() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The one-line summary a tool card shows: the call's primary locator
+/// (path/command/pattern/…), else its first non-empty string argument. Full
+/// text up to 4 KiB, so a long command stays readable in the tooltip.
+fn args_preview_of(args: &serde_json::Value) -> String {
+    let clip = |s: &str| -> String {
+        let s = s.trim();
+        if s.chars().count() > 4096 {
+            let prefix: String = s.chars().take(4096).collect();
+            format!("{prefix}...")
+        } else {
+            s.to_string()
+        }
+    };
+    for key in [
+        "path", "command", "pattern", "query", "file", "action", "url", "target",
+    ] {
+        if let Some(s) = args.get(key).and_then(|v| v.as_str()) {
+            return clip(s);
+        }
+    }
+    if let Some(obj) = args.as_object() {
+        for v in obj.values() {
+            if let Some(s) = v.as_str() {
+                if !s.trim().is_empty() {
+                    return clip(s);
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 /// How an approval wait ended. A cancel, a timeout and a deliberate refusal
@@ -1283,21 +1313,31 @@ impl Engine {
 
             tool_rounds += 1;
 
+            // Announce the whole round before dispatching it: the calls run one
+            // at a time, so without this the stream stands still until each
+            // call's turn comes.
+            for call in calls.iter() {
+                let args: serde_json::Value = serde_json::from_str(&call.arguments)
+                    .unwrap_or_else(|_| serde_json::json!({ "_malformed": call.arguments }));
+                let _ = io.ui_tx.send(UiEvent::ToolCallQueued {
+                    name: call.name.clone(),
+                    args_preview: args_preview_of(&args),
+                    call_id: call.id.clone(),
+                    parent: None,
+                    child_id: None,
+                });
+            }
+
             for (call_idx, call) in calls.iter().enumerate() {
                 // P0-C4: cancel between tool dispatches — a destructive tool
                 // must not fire after the user already hit Cancel.
                 if io.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    // This call's card has not been drawn yet —
-                    // `ToolCallStarted` comes further down — so there is no
-                    // spinner to settle. A `ToolCallFinished` here would
-                    // invent a failed card for a call that never showed.
                     return self.abort_cancelled(
                         io,
                         history,
                         &calls,
                         call_idx,
                         "cancelled before dispatch",
-                        None,
                     );
                 }
                 // Skip degenerate calls — a text-protocol echo can produce an
@@ -1310,6 +1350,7 @@ impl Engine {
                     // providers reject the next request (deepseek 400).
                     let msg = "skipped malformed empty tool call".to_string();
                     let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                        call_id: call.id.clone(),
                         name: call.name.clone(),
                         ok: false,
                         content: msg.clone(),
@@ -1338,50 +1379,13 @@ impl Engine {
                     .map(|f| f(&args, &self.ctx))
                     .unwrap_or_default();
                 let review_summary = review.summary.take();
-                let args_preview = review_summary.clone().unwrap_or_else(|| {
-                    args.get("path")
-                        .or_else(|| args.get("command"))
-                        .or_else(|| args.get("pattern"))
-                        .or_else(|| args.get("query"))
-                        .or_else(|| args.get("file"))
-                        .or_else(|| args.get("action"))
-                        .or_else(|| args.get("url"))
-                        .or_else(|| args.get("target"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| {
-                            let s = s.trim();
-                            if s.chars().count() > 4096 {
-                                let mut chars = s.chars();
-                                let prefix: String = chars.by_ref().take(4096).collect();
-                                format!("{prefix}...")
-                            } else {
-                                s.to_string()
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            if let Some(obj) = args.as_object() {
-                                for v in obj.values() {
-                                    if let Some(s) = v.as_str() {
-                                        let s = s.trim();
-                                        if !s.is_empty() {
-                                            if s.chars().count() > 4096 {
-                                                let mut chars = s.chars();
-                                                let prefix: String =
-                                                    chars.by_ref().take(4096).collect();
-                                                return format!("{prefix}...");
-                                            } else {
-                                                return s.to_string();
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            String::new()
-                        })
-                });
+                let args_preview = review_summary
+                    .clone()
+                    .unwrap_or_else(|| args_preview_of(&args));
                 let _ = io.ui_tx.send(UiEvent::ToolCallStarted {
                     name: call.name.clone(),
                     args_preview,
+                    call_id: call.id.clone(),
                     parent: None,
                     child_id: None,
                 });
@@ -1396,6 +1400,7 @@ impl Engine {
                 let mut call_mut = call.clone();
                 if let Err(msg) = self.hooks.run_before_tool(&mut call_mut).await {
                     let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                        call_id: call.id.clone(),
                         name: call.name.clone(),
                         ok: false,
                         content: msg.clone(),
@@ -1406,6 +1411,7 @@ impl Engine {
                     history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
                     continue;
                 }
+                call_mut.id.clone_from(&call.id);
                 let call = &call_mut; // hooks may have rewritten args
                                       // Gate + dispatch must see the *rewritten* arguments; `args`
                                       // above is the model's own request, kept for the step card's
@@ -1478,6 +1484,7 @@ impl Engine {
                                 Err(e) => {
                                     let msg = e.to_string();
                                     let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                        call_id: call.id.clone(),
                                         name: call.name.clone(),
                                         ok: false,
                                         content: msg.clone(),
@@ -1513,6 +1520,7 @@ impl Engine {
                 if let Some(reason) = review.deny.take() {
                     self.denials_this_turn.push(call.name.clone());
                     let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                        call_id: call.id.clone(),
                         name: call.name.clone(),
                         ok: false,
                         content: reason.clone(),
@@ -1543,6 +1551,7 @@ impl Engine {
                 match decision {
                     Decision::Deny { reason } => {
                         let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                            call_id: call.id.clone(),
                             name: call.name.clone(),
                             ok: false,
                             content: reason.clone(),
@@ -1566,6 +1575,7 @@ impl Engine {
                                 true,
                             );
                             let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                call_id: call.id.clone(),
                                 name: call.name.clone(),
                                 ok: false,
                                 content: APPROVAL_TIMEOUT_UI.to_string(),
@@ -1581,6 +1591,7 @@ impl Engine {
                         if let Some(prepare) = review.prepare.take() {
                             if let Err(msg) = prepare.await {
                                 let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                    call_id: call.id.clone(),
                                     name: call.name.clone(),
                                     ok: false,
                                     content: msg.clone(),
@@ -1629,6 +1640,7 @@ impl Engine {
                                 let msg = format!("user denied {call_name}", call_name = call.name);
                                 self.denials_this_turn.push(call.name.clone());
                                 let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                    call_id: call.id.clone(),
                                     name: call.name.clone(),
                                     ok: false,
                                     content: msg.clone(),
@@ -1648,6 +1660,7 @@ impl Engine {
                                     call.name
                                 );
                                 let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                    call_id: call.id.clone(),
                                     name: call.name.clone(),
                                     ok: false,
                                     content: msg.clone(),
@@ -1671,6 +1684,7 @@ impl Engine {
                                     child_id: self.child_id(),
                                 });
                                 let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                    call_id: call.id.clone(),
                                     name: call.name.clone(),
                                     ok: false,
                                     content: APPROVAL_TIMEOUT_UI.to_string(),
@@ -1718,6 +1732,7 @@ impl Engine {
                         };
                         if let Some(msg) = post_deny {
                             let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                                call_id: call.id.clone(),
                                 name: call.name.clone(),
                                 ok: false,
                                 content: msg.clone(),
@@ -1734,6 +1749,7 @@ impl Engine {
 
                 if let Some(msg) = self.policy.before_dispatch(&call.name, is_readonly).await {
                     let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                        call_id: call.id.clone(),
                         name: call.name.clone(),
                         ok: false,
                         content: msg.clone(),
@@ -1787,7 +1803,6 @@ impl Engine {
                                 &calls,
                                 call_idx,
                                 "cancelled while running",
-                                Some(call.name.clone()),
                             );
                         };
                         dispatched
@@ -1852,7 +1867,6 @@ impl Engine {
                                         &calls,
                                         call_idx,
                                         "cancelled while running",
-                                        Some(call.name.clone()),
                                     );
                                 };
                                 match routed {
@@ -1900,6 +1914,7 @@ impl Engine {
                 self.hooks.run_after_tool(&call, &mut content).await;
 
                 let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+                    call_id: call.id.clone(),
                     name: call.name.clone(),
                     ok,
                     content: content.clone(),
@@ -1954,9 +1969,8 @@ impl Engine {
     /// Every call from `from` on still gets a tool result — an assistant row
     /// carrying `tool_calls` with unanswered results orphans the next request
     /// (strict providers reject it) and makes a reloaded view silently drop
-    /// chips the live view had. `running` names the call whose dispatch was
-    /// interrupted, so its card settles instead of spinning forever — `None`
-    /// when the cancel landed before that call's `ToolCallStarted`.
+    /// chips the live view had. Every queued invocation receives its terminal
+    /// event, including calls cancelled before dispatch.
     fn abort_cancelled(
         &mut self,
         io: &mut EngineIo,
@@ -1964,19 +1978,17 @@ impl Engine {
         calls: &[agent_llm_core::types::ToolCall],
         from: usize,
         label: &str,
-        running: Option<String>,
     ) -> Result<TurnOutcome, String> {
-        if let Some(name) = running {
+        for pending_call in calls.iter().skip(from) {
             let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                name,
+                call_id: pending_call.id.clone(),
+                name: pending_call.name.clone(),
                 ok: false,
                 content: CANCEL_TEXT.into(),
                 ui_type: None,
                 parent: None,
                 child_id: None,
             });
-        }
-        for pending_call in calls.iter().skip(from) {
             history.push(ChatMessage::tool_result_err(pending_call.id.clone(), label));
         }
         history.push(ChatMessage::notice(CANCEL_TEXT));

@@ -165,11 +165,10 @@ fn cancelling_tool(flag: Arc<AtomicBool>) -> ToolSpec {
     }
 }
 
-/// Cancel between two calls: the second never starts, so the UI must not get
-/// a `ToolCallFinished` for it — there is no card to settle, and a stray one
-/// draws a failed call that never ran. History still answers both calls.
+/// Cancellation between calls settles both queue entries while the second
+/// call stays undispatched. History answers both calls.
 #[tokio::test]
-async fn cancel_before_dispatch_draws_no_card() {
+async fn cancel_before_dispatch_settles_the_queued_card() {
     let cancel = Arc::new(AtomicBool::new(false));
     let dropped = Arc::new(AtomicBool::new(false));
     let mut registry = ToolRegistry::new();
@@ -230,16 +229,29 @@ async fn cancel_before_dispatch_draws_no_card() {
         "the second call never ran"
     );
 
-    let (mut started, mut finished) = (Vec::new(), Vec::new());
+    let (mut queued, mut started, mut finished) = (Vec::new(), Vec::new(), Vec::new());
     while let Some(ev) = ui_rx.try_recv() {
         match ev {
-            agent_ipc::UiEvent::ToolCallStarted { name, .. } => started.push(name),
-            agent_ipc::UiEvent::ToolCallFinished { name, ok, .. } => finished.push((name, ok)),
+            agent_ipc::UiEvent::ToolCallQueued { call_id, .. } => queued.push(call_id),
+            agent_ipc::UiEvent::ToolCallStarted { call_id, name, .. } => {
+                started.push((call_id, name))
+            }
+            agent_ipc::UiEvent::ToolCallFinished {
+                call_id, name, ok, ..
+            } => finished.push((call_id, name, ok)),
             _ => {}
         }
     }
-    assert_eq!(started, vec!["first".to_string()], "{started:?}");
-    assert_eq!(finished, vec![("first".to_string(), true)], "{finished:?}");
+    assert_eq!(queued, vec!["c1", "c2"]);
+    assert_eq!(started, vec![("c1".into(), "first".into())], "{started:?}");
+    assert_eq!(
+        finished,
+        vec![
+            ("c1".into(), "first".into(), true),
+            ("c2".into(), "slow".into(), false)
+        ],
+        "{finished:?}"
+    );
 
     let answered: Vec<_> = history
         .iter()

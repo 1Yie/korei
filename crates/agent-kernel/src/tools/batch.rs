@@ -487,6 +487,7 @@ async fn exec(
         .enumerate()
         .map(|(i, (item, flag))| {
             let ctx = ctx.clone();
+            let call_id = format!("batch:{}", crate::engine::next_request_id());
             let batch_cancel = budget.cancel.clone();
             let deadline = budget.deadline;
             let (tool, call_args) = match item {
@@ -506,9 +507,11 @@ async fn exec(
                                 name: tool.clone(),
                                 parent: Some("batch_execute".into()),
                                 args_preview: String::new(),
+                                call_id: call_id.clone(),
                                 child_id: None,
                             });
                             let _ = ui.send(agent_ipc::events::UiEvent::ToolCallFinished {
+                                call_id,
                                 name: tool.clone(),
                                 ok: false,
                                 content: reason.clone(),
@@ -537,6 +540,9 @@ async fn exec(
                                 // Nested — the UI renders this under the
                                 // batch_execute capsule, not top-level.
                                 parent: Some("batch_execute".into()),
+                                // Items carry no queue entry: only the round's
+                                // own calls are announced ahead of dispatch.
+                                call_id: call_id.clone(),
                                 args_preview: call_args
                                     .get("path")
                                     .or_else(|| call_args.get("pattern"))
@@ -592,6 +598,7 @@ async fn exec(
                                 _ => (false, out.body.clone()),
                             };
                             let _ = ui.send(agent_ipc::events::UiEvent::ToolCallFinished {
+                                call_id,
                                 name: tool,
                                 ok,
                                 content,

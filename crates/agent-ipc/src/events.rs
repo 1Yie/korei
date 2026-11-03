@@ -136,12 +136,32 @@ pub enum UiEvent {
         #[serde(default)]
         child_id: Option<u64>,
     },
+    /// A call of the coming round that has not been dispatched yet. The whole
+    /// round is announced before the first call runs, in dispatch order, so the
+    /// stream can show what is still queued instead of standing still.
+    ToolCallQueued {
+        name: String,
+        args_preview: String,
+        /// Invocation identity repeated by the start and finish events.
+        #[serde(default)]
+        call_id: String,
+        /// Same nesting marker as `ToolCallStarted::parent`.
+        #[serde(default)]
+        parent: Option<String>,
+        /// Same child marker as `ToolCallStarted::child_id`.
+        #[serde(default)]
+        child_id: Option<u64>,
+    },
     /// A tool began executing. `args_preview` is a single-line summary of
     /// the call's target (a path / command / pattern) shown on the capsule —
     /// the full output only appears when the capsule is expanded.
     ToolCallStarted {
         name: String,
         args_preview: String,
+        /// Identity shared by the queued, started and finished events.
+        /// Empty when the recorded event carries no invocation identity.
+        #[serde(default)]
+        call_id: String,
         /// Set on calls emitted INSIDE another tool (`batch_execute`
         /// items) — the UI nests them under the parent capsule instead
         /// of counting them as top-level calls.
@@ -154,6 +174,9 @@ pub enum UiEvent {
     /// A tool finished (or failed); `content` is the truncated model-facing
     /// text, `ui_type` is the optional typed card hint (`diff`/`table`/…).
     ToolCallFinished {
+        /// Same invocation identity as the queued and started events.
+        #[serde(default)]
+        call_id: String,
         name: String,
         ok: bool,
         content: String,
@@ -272,4 +295,38 @@ pub enum UiEvent {
     /// composer always renders the kernel's list (single source of truth).
     /// Carries the full list — queue ops are rare and the list is small.
     QueuedPrompts { items: Vec<String> },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UiEvent;
+
+    #[test]
+    fn tool_finish_identity_round_trips_and_defaults_when_absent() {
+        let mut encoded = serde_json::to_value(UiEvent::ToolCallFinished {
+            call_id: "call-7".into(),
+            name: "read".into(),
+            ok: true,
+            content: "result".into(),
+            ui_type: None,
+            parent: None,
+            child_id: None,
+        })
+        .unwrap();
+        assert_eq!(encoded["ToolCallFinished"]["call_id"], "call-7");
+        let restored: UiEvent = serde_json::from_value(encoded.clone()).unwrap();
+        assert!(matches!(
+            restored,
+            UiEvent::ToolCallFinished { call_id, .. } if call_id == "call-7"
+        ));
+        encoded["ToolCallFinished"]
+            .as_object_mut()
+            .unwrap()
+            .remove("call_id");
+        let restored: UiEvent = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            restored,
+            UiEvent::ToolCallFinished { call_id, .. } if call_id.is_empty()
+        ));
+    }
 }

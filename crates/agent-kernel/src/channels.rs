@@ -426,6 +426,7 @@ mod tests {
         tx.send(UiEvent::ToolCallStarted {
             name: "read".into(),
             args_preview: "x.rs".into(),
+            call_id: "call_0".into(),
             parent: None,
             child_id: None,
         })
