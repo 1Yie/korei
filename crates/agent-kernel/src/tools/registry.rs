@@ -364,7 +364,8 @@ mod tests {
                 "batch_execute",
                 "delegate",
                 "link_workspace",
-                "todo"
+                "todo",
+                "wait_child"
             ]
         );
     }
@@ -383,7 +384,7 @@ mod tests {
     #[test]
     fn child_builtins_exclude_recursion_and_human_tools() {
         let child = ToolRegistry::child_builtins();
-        for banned in ["delegate", "answer_child", "ask_question"] {
+        for banned in ["delegate", "answer_child", "wait_child", "ask_question"] {
             assert!(
                 child.spec(banned).is_none(),
                 "child registry must not hold `{banned}`"

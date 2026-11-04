@@ -205,6 +205,7 @@ impl Drop for AwaitGuard {
     fn drop(&mut self) {
         if self.armed {
             abort_child(self.session, self.child);
+            deliver_handoff(&self.card.ctx, self.child, HandoffState::Cancelled);
             self.card.close(false, "已中断");
         }
     }
@@ -725,9 +726,14 @@ struct ChildGuard(u64);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let mut guard = ACTIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(live) = guard.as_mut() {
-            live.remove(&self.0);
+        let handle = {
+            let mut guard = ACTIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_mut().and_then(|live| live.remove(&self.0))
+        };
+        if let Some(handle) = handle {
+            if let Some(spawner) = handle.card.ctx.subagent() {
+                spawner.0.child_exited(handle.session, self.0);
+            }
         }
     }
 }
@@ -773,6 +779,7 @@ fn abort_child(session: i64, id: u64) {
         if let Some(abort) = abort {
             abort.abort();
         }
+        deliver_handoff(&handle.card.ctx, id, HandoffState::Cancelled);
     }
 }
 
@@ -852,8 +859,11 @@ fn deliver_answer(session: i64, id: u64, answer: String) -> Result<ChildRef, Str
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .take();
-    tx.send(answer)
-        .map_err(|_| format!("subagent {id} stopped waiting before the answer arrived"))?;
+    deliver_handoff(&child.card.ctx, id, HandoffState::Pending);
+    tx.send(answer).map_err(|_| {
+        deliver_handoff(&child.card.ctx, id, HandoffState::Cancelled);
+        format!("subagent {id} stopped waiting before the answer arrived")
+    })?;
     Ok(child)
 }
 
@@ -966,6 +976,7 @@ pub struct SubagentSpawner {
     /// a headless run: the child denies instead of parking on a card nobody
     /// will see.
     child_approvals: bool,
+    handoffs: Arc<std::sync::Mutex<ChildHandoffs>>,
 }
 
 /// The child registry a host handed in, plus `ask_parent`. It is added here and
@@ -996,6 +1007,7 @@ impl SubagentSpawner {
             }),
             parent_gate: None,
             child_approvals: false,
+            handoffs: Arc::new(std::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -1102,7 +1114,8 @@ impl SubagentSpawner {
         }
         // No deadline: a stuck child is the cancel's job. A question ends the
         // wait for everyone, though — see above.
-        while let Some((i, _, first)) = pending.next().await {
+        while let Some((i, id, first)) = pending.next().await {
+            deliver_handoff(&parent_ctx, id, first.handoff_state());
             let asked = matches!(first, FirstOutcome::Asked(_));
             results[i] = Some((started_at[i].elapsed().as_secs_f32(), first));
             if asked {
@@ -1177,7 +1190,10 @@ impl SubagentSpawner {
         label: &str,
     ) -> Result<String, String> {
         let started = self.start(parent_ctx, task, readonly, spec, cancel, label, false)?;
-        match started.first().await {
+        let (owner, id) = (started.owner, started.id);
+        let first = started.first().await;
+        self.deliver_handoff(owner, id, first.handoff_state());
+        match first {
             FirstOutcome::Asked(text) => Ok(text),
             FirstOutcome::Done(result) => result,
         }
@@ -1381,6 +1397,13 @@ impl SubagentSpawner {
         let running = tokio::spawn(child_run.drive(task, preview));
         *abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(running.abort_handle());
 
+        self.handoffs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                (owner, child_id),
+                tokio::sync::watch::channel(HandoffState::Pending).0,
+            );
         Ok(StartedChild {
             owner,
             id: child_id,
@@ -1390,6 +1413,58 @@ impl SubagentSpawner {
             cancel,
             parent: parent_ctx,
         })
+    }
+
+    fn deliver_handoff(&self, session: i64, id: u64, mut state: HandoffState) {
+        if matches!(state, HandoffState::Question) && owned_child(session, id).is_err() {
+            state = HandoffState::Cancelled;
+        }
+        let sender = self
+            .handoffs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(session, id))
+            .cloned();
+        if let Some(sender) = sender {
+            sender.send_replace(state);
+            if matches!(state, HandoffState::Finished | HandoffState::Cancelled) {
+                self.handoffs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&(session, id));
+            }
+        }
+    }
+
+    fn child_exited(&self, session: i64, id: u64) {
+        let parked = self
+            .handoffs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(session, id))
+            .is_some_and(|sender| matches!(*sender.borrow(), HandoffState::Question));
+        if parked {
+            self.deliver_handoff(session, id, HandoffState::Cancelled);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum HandoffState {
+    Pending,
+    Question,
+    Finished,
+    Cancelled,
+}
+
+type ChildHandoffs =
+    std::collections::HashMap<(i64, u64), tokio::sync::watch::Sender<HandoffState>>;
+
+fn deliver_handoff(ctx: &ToolCtx, id: u64, state: HandoffState) {
+    if let Some(spawner) = ctx.subagent() {
+        spawner
+            .0
+            .deliver_handoff(ctx.session().unwrap_or(0), id, state);
     }
 }
 
@@ -1411,6 +1486,16 @@ enum FirstOutcome {
     Asked(String),
     /// Finished: the report, or the failure / cancel marker.
     Done(Result<String, String>),
+}
+
+impl FirstOutcome {
+    fn handoff_state(&self) -> HandoffState {
+        match self {
+            Self::Asked(_) => HandoffState::Question,
+            Self::Done(Err(error)) if is_cancel_marker(error) => HandoffState::Cancelled,
+            Self::Done(_) => HandoffState::Finished,
+        }
+    }
 }
 
 impl StartedChild {
@@ -1492,17 +1577,20 @@ fn detach(
     use futures::StreamExt;
 
     let notify = parent_ctx.ext.get::<ChildNotifier>();
+    let parent = parent_ctx.clone();
     tokio::spawn(async move {
         while let Some((i, id, first)) = pending.next().await {
-            let Some(text) = background_notice(&labels[i], id, first) else {
-                continue;
-            };
-            match &notify {
-                Some(notify) => (notify.0)(text),
-                // Nothing to tell: the card already closed, and a parked child
-                // still shows among the session's active children.
-                None => tracing::debug!(child = id, "detached subagent outcome has no notifier"),
+            let state = first.handoff_state();
+            if let Some(text) = background_notice(&labels[i], id, first) {
+                match &notify {
+                    Some(notify) => (notify.0)(text),
+                    // A headless host can expose the child's card without a notifier.
+                    None => {
+                        tracing::debug!(child = id, "detached subagent outcome has no notifier")
+                    }
+                }
             }
+            deliver_handoff(&parent, id, state);
         }
     });
 }
@@ -1525,15 +1613,14 @@ fn detach_child(
         let mut guard = AwaitGuard::arm(session, id, child.card.clone());
         let first = first_outcome(session, id, &label, &child, &parent, &cancel).await;
         guard.armed = false;
-        let Some(text) = background_notice(&label, id, first) else {
-            return;
-        };
-        match &notify {
-            Some(notify) => (notify.0)(text),
-            // Nothing to tell: the card already closed, and the child still
-            // shows among the session's active children.
-            None => tracing::debug!(child = id, "detached subagent outcome has no notifier"),
+        let state = first.handoff_state();
+        if let Some(text) = background_notice(&label, id, first) {
+            match &notify {
+                Some(notify) => (notify.0)(text),
+                None => tracing::debug!(child = id, "detached subagent outcome has no notifier"),
+            }
         }
+        deliver_handoff(&parent, id, state);
     });
 }
 
@@ -1789,7 +1876,9 @@ pub fn spec() -> ToolSpec {
              With `tasks`, the call returns as soon as one child asks (or when all finish);\n\
              siblings still running keep going and their reports arrive later as notices.\n\
              `background: true` returns at once with the child's id; its question or report\n\
-             arrives as a notice, so use it when you have other work to do meanwhile.",
+             arrives as a notice. Continue only independent work; when a child's next update\n\
+             is needed and no independent work remains, call `wait_child` with its child_id.\n\
+             Do not repeat the delegated review or repository reads to fill the wait.",
         ),
         // Not readonly: the delegation act itself writes nothing, but a
         // full child may mutate state — so `default` mode asks once, and a
@@ -1962,8 +2051,10 @@ async fn exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, ToolError> {
         detach(&ctx, waiting, vec![label.clone()]);
         return Ok(ToolResult::text(format!(
             "[subagent {label} (child_id {id}) is running in the background]\n\
-             Keep working — its question or report arrives as a notice. Answer a question \
-             with answer_child {{ child_id: {id}, background: true }}."
+             Continue independent work only. When this child's next question or report is \
+             needed and no independent work remains, call wait_child {{ child_id: {id} }}. \
+             Do not repeat repository reads or repeat the delegated review to fill the wait. \
+             Answer a question with answer_child {{ child_id: {id}, background: true }}."
         )));
     }
     // Single-child calls inherit the parent's cancel flag; a parallel batch gets
@@ -1990,9 +2081,88 @@ async fn exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, ToolError> {
     Ok(ToolResult::text(text))
 }
 
-/// Tools only a parent holds: `delegate` would recurse, and `answer_child` is
-/// how a parent answers its own child. The child registry drops both.
-pub const PARENT_ONLY_TOOLS: &[&str] = &["delegate", "answer_child"];
+/// Tools for directing and waiting on children, excluded from child registries.
+pub const PARENT_ONLY_TOOLS: &[&str] = &["delegate", "answer_child", "wait_child"];
+
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WaitChildArgs {
+    child_id: u64,
+}
+
+pub fn wait_child_spec() -> ToolSpec {
+    ToolSpec {
+        name: "wait_child",
+        schema: schema_for::<WaitChildArgs>(
+            "Wait for a delegated child's next question or final report when no independent\n\
+             work remains. This suspends the current tool round, including in goal mode,\n\
+             without polling files or starting another parent model request. The update\n\
+             arrives through the existing parent notice channel; answer questions with\n\
+             answer_child. Only handoffs of this session can be waited on. Cancellation\n\
+             releases the wait without spawning, retrying or independently stopping a child.",
+        ),
+        readonly: true,
+        class: super::registry::ToolClass::Orchestration,
+        network: false,
+        staged: false,
+        review: None,
+        cancel_aware: false,
+        exec: Arc::new(|args, ctx| wait_child_exec(args, ctx).boxed()),
+    }
+}
+
+async fn wait_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, ToolError> {
+    let parsed: WaitChildArgs =
+        serde_json::from_value(args).map_err(|e| ToolError::Args(e.to_string()))?;
+    let spawner = ctx
+        .subagent()
+        .map(|spawner| spawner.0.clone())
+        .ok_or_else(|| ToolError::Failed("delegation unavailable in this context".into()))?;
+    let receiver = spawner
+        .handoffs
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(ctx.session().unwrap_or(0), parsed.child_id))
+        .map(tokio::sync::watch::Sender::subscribe);
+    let Some(mut updates) = receiver else {
+        return Ok(ToolResult::text(format!(
+            "subagent {} has no pending handoff in this session; read any already-delivered update",
+            parsed.child_id
+        )));
+    };
+    loop {
+        let state = *updates.borrow_and_update();
+        match state {
+            HandoffState::Question => {
+                return Ok(ToolResult::text(format!(
+                    "subagent {} delivered a question; read the parent update and use answer_child",
+                    parsed.child_id
+                )));
+            }
+            HandoffState::Finished => {
+                return Ok(ToolResult::text(format!(
+                    "subagent {} delivered its report; read the parent update",
+                    parsed.child_id
+                )));
+            }
+            HandoffState::Cancelled => {
+                return Err(ToolError::Failed(cancel_marker(parsed.child_id)));
+            }
+            HandoffState::Pending => {
+                if ctx.ext.get::<ChildNotifier>().is_none() {
+                    return Err(ToolError::Failed(
+                        "waiting for background children requires a parent notice notifier".into(),
+                    ));
+                }
+            }
+        }
+        updates.changed().await.map_err(|_| {
+            ToolError::Failed(format!(
+                "subagent {} ended without a parent handoff",
+                parsed.child_id
+            ))
+        })?;
+    }
+}
 
 /// Longest question a child may park on — the same order as `ask_question`'s,
 /// because it lands in the parent's history as a tool result either way.
@@ -2141,8 +2311,9 @@ async fn answer_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, 
         );
         return Ok(ToolResult::text(format!(
             "[subagent {label} (child_id {}) keeps running in the background]\n\
-             Its next question or report arrives as a notice.",
-            parsed.child_id
+             Its next question or report arrives as a notice. When it is needed and no \
+             independent work remains, use wait_child {{ child_id: {} }}.",
+            parsed.child_id, parsed.child_id
         )));
     }
     let cancel = ctx
@@ -2150,28 +2321,24 @@ async fn answer_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, 
         .clone()
         .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)));
     let mut guard = AwaitGuard::arm(session, parsed.child_id, child.card.clone());
-    let next = await_outcome(session, parsed.child_id, &child, &cancel).await;
+    let next = first_outcome(
+        session,
+        parsed.child_id,
+        &child.card.label,
+        &child,
+        &ctx,
+        &cancel,
+    )
+    .await;
     // The child is the session's again: whether it parks or finishes, this call
     // does not own its lifetime.
     guard.armed = false;
-    // Same rule as `delegate`: a cancel ends this call with the child named,
-    // whichever side noticed the flag first.
-    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-        abort_child(session, parsed.child_id);
-        return Err(ToolError::Failed(cancel_marker(parsed.child_id)));
-    }
+    deliver_handoff(&ctx, parsed.child_id, next.handoff_state());
     match next {
-        Ok(ChildOutcome::Done { ok: true, report }) => Ok(ToolResult::text(report)),
-        Ok(ChildOutcome::Done { ok: false, report }) => Err(ToolError::Failed(report)),
-        Ok(ChildOutcome::Asked(question)) => {
-            emit_waiting(&ctx, parsed.child_id, &child.card.label, &question);
-            Ok(ToolResult::text(waiting_text(
-                &child.card.label,
-                parsed.child_id,
-                &question,
-            )))
+        FirstOutcome::Done(Ok(report)) | FirstOutcome::Asked(report) => {
+            Ok(ToolResult::text(report))
         }
-        Err(e) => Err(ToolError::Failed(e)),
+        FirstOutcome::Done(Err(error)) => Err(ToolError::Failed(error)),
     }
 }
 

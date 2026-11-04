@@ -31,6 +31,13 @@ to return while the child continues. Child outcomes reach the host's
 `ChildNotifier`; `active_child_infos` includes background status. Background mode
 and parallel `tasks` are mutually exclusive.
 
+When no independent work remains, the parent calls `wait_child` to keep its
+tool round open until the next handoff. The host connects `ChildNotifier` to
+that round's notice receiver: waiting returns delivery status, while the notice
+carries the question or report once.
+Hosts retain the session's `SubagentSpawner` across turns so background handoffs
+remain addressable.
+
 A host installs `BackgroundCancel` through `install_background_cancel` so child
 lifetime can outlast a turn without inheriting its resettable cancellation flag.
 The host owns session cancellation and shutdown through the child-control APIs.
