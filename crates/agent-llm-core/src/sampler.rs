@@ -381,13 +381,9 @@ impl Sampler {
         }
 
         if !done_seen {
-            // Clean close without Done — synthesize so the caller's
-            // invariants hold (spec: Done fires exactly once).
-            on_chunk(&StreamChunk::Done {
-                prompt_tokens: None,
-                completion_tokens: None,
-                cached_tokens: None,
-            });
+            return Err(SampleError::Stream(
+                "fatal: stream ended without completion".into(),
+            ));
         }
         Ok(())
     }
@@ -433,6 +429,10 @@ fn doom_detected(recent: &VecDeque<String>) -> bool {
 /// Decide retryability from an error string: 429/5xx and transport-level
 /// failures retry; other 4xx never do (spec: "never on other 4xx").
 fn classify_transport_error(msg: &str) -> SampleError {
+    // Parse errors can contain transport-like words such as "EOF".
+    if msg.starts_with("provider protocol error:") {
+        return SampleError::Stream(format!("fatal: {msg}"));
+    }
     // `send_sse` prefixes real HTTP failures with `provider HTTP <code>` — a
     // parsed status beats substring guessing. Without it, a body that merely
     // CONTAINS a number ("max_tokens 15000", a request id with "500" in it)
@@ -972,9 +972,7 @@ mod tests {
         assert!(events.iter().any(|e| e.contains("Failed")));
     }
 
-    /// `Done` ordering guarantee: a provider that double-fires is swallowed
-    /// to one; a clean close without `Done` synthesizes one — either way
-    /// the caller's invariant is exactly-one-Done per attempt.
+    /// A completed attempt delivers exactly one Done.
     #[tokio::test]
     async fn done_fires_exactly_once_per_attempt() {
         // Double Done → one reaches on_chunk.
@@ -996,26 +994,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(dones, 1, "provider double-Done is swallowed");
+    }
 
-        // Clean close, no Done → synthesized.
-        let p = ScriptedProvider::of(vec![Script::Chunks(vec![delta("x")])]);
-        let sampler = Sampler::new(p);
-        let mut dones = 0usize;
-        sampler
-            .sample(
-                req(),
-                &[],
-                |c| {
-                    if matches!(c, StreamChunk::Done { .. }) {
-                        dones += 1;
-                    }
-                },
-                |_| {},
-                || {},
-            )
-            .await
-            .unwrap();
-        assert_eq!(dones, 1, "missing Done is synthesized");
+    #[tokio::test]
+    async fn incomplete_stream_fails_without_retry_or_done() {
+        for chunks in [
+            vec![],
+            vec![delta("partial")],
+            vec![Ok(StreamChunk::ToolCallDelta {
+                slot: 0,
+                id: Some("call_1".into()),
+                name: Some("todo".into()),
+                args_delta: "{\"action\":".into(),
+            })],
+        ] {
+            let expected = chunks.len();
+            let p = ScriptedProvider::of(vec![Script::Chunks(chunks)]);
+            let sampler = Sampler::new(p.clone());
+            let mut seen = Vec::new();
+            let mut events = Vec::new();
+            let result = sampler
+                .sample(
+                    req(),
+                    &[],
+                    |c| seen.push(c.clone()),
+                    |e| events.push(e.clone()),
+                    || {},
+                )
+                .await;
+            assert!(result.is_err(), "unterminated stream succeeded: {seen:?}");
+            assert_eq!(seen.len(), expected, "partial output must appear once");
+            assert!(!seen.iter().any(|c| matches!(c, StreamChunk::Done { .. })));
+            assert_eq!(p.calls.load(Ordering::SeqCst), 1);
+            assert!(!events
+                .iter()
+                .any(|e| matches!(e, SamplerEvent::Retrying { .. })));
+        }
     }
 
     /// An in-stream `StreamChunk::Error` (provider `response.failed` event)

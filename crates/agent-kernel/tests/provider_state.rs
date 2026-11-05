@@ -109,6 +109,51 @@ fn done() -> StreamChunk {
 }
 
 #[tokio::test]
+async fn incomplete_tool_stream_aborts_before_execution() {
+    let provider = Arc::new(RecordingProvider {
+        scripted: ScriptedProvider::new(),
+        requests: Mutex::new(Vec::new()),
+    });
+    provider.scripted.push_script(vec![
+        StreamChunk::ContentDelta("partial".into()),
+        StreamChunk::ToolCallDelta {
+            slot: 0,
+            id: Some("call_1".into()),
+            name: Some("todo".into()),
+            args_delta: r#"{"action":"list"}"#.into(),
+        },
+    ]);
+    let mut engine = Engine::new(
+        provider.clone(),
+        Arc::new(ToolRegistry::with_builtins()),
+        Arc::new(ToolCtx::new()),
+        "fixture-model",
+        0.0,
+    );
+    engine.set_permissions(PermissionGate::from_mode_str("bypassPermissions"));
+    let (ui_tx, _ui_rx) = agent_kernel::channels::UiSink::channel();
+    let mut io = EngineIo {
+        ui_tx,
+        steer_rx: tokio::sync::mpsc::channel(4).1,
+        notice_rx: tokio::sync::mpsc::channel(4).1,
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let mut history = vec![ChatMessage::system("stable")];
+    let result = engine.run_turn(&mut io, &mut history, "check".into()).await;
+    assert!(result.unwrap_err().contains("without completion"));
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    assert!(!history.iter().any(|m| m.role == Role::Tool));
+    assert_eq!(
+        history
+            .iter()
+            .filter(|m| m.role == Role::Assistant && m.content.as_deref() == Some("partial"))
+            .count(),
+        1,
+        "partial output is preserved once"
+    );
+}
+
+#[tokio::test]
 async fn provider_state_survives_a_tool_round_the_next_request_and_a_reload() {
     let provider = Arc::new(RecordingProvider {
         scripted: ScriptedProvider::new(),
