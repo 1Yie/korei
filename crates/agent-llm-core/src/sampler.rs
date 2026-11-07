@@ -301,7 +301,7 @@ impl Sampler {
                 ESTABLISH_TIMEOUT.as_secs()
             ))
         })?
-        .map_err(|e| classify_transport_error(&e.to_string()))?;
+        .map_err(|e| classify_provider_error(&e))?;
 
         let mut recent: VecDeque<String> = VecDeque::with_capacity(64);
         let mut recent_bytes = 0usize;
@@ -322,9 +322,7 @@ impl Sampler {
                     Err(_) => on_idle(),
                     Ok(None) => break None,
                     Ok(Some(Err(e))) => {
-                        let msg = e.to_string();
-                        let err = classify_transport_error(&msg);
-                        return Err(err);
+                        return Err(classify_provider_error(&e));
                     }
                     Ok(Some(Ok(StreamChunk::Keepalive))) => {
                         idle_since = tokio::time::Instant::now();
@@ -426,8 +424,18 @@ fn doom_detected(recent: &VecDeque<String>) -> bool {
     false
 }
 
-/// Decide retryability from an error string: 429/5xx and transport-level
-/// failures retry; other 4xx never do (spec: "never on other 4xx").
+/// Honor explicit replay prohibitions before the legacy text classifier.
+fn classify_provider_error(error: &anyhow::Error) -> SampleError {
+    if error
+        .chain()
+        .any(|cause| cause.is::<crate::provider::NonRetryableProviderError>())
+    {
+        return SampleError::Stream(format!("fatal: {error}"));
+    }
+    classify_transport_error(&error.to_string())
+}
+
+/// Retry 429/5xx and transport failures; other 4xx are permanent.
 fn classify_transport_error(msg: &str) -> SampleError {
     // Parse errors can contain transport-like words such as "EOF".
     if msg.starts_with("provider protocol error:") {
@@ -577,6 +585,7 @@ mod tests {
     /// phase) or the stream yields these items then closes.
     enum Script {
         EstablishFail(&'static str),
+        EstablishError(anyhow::Error),
         Chunks(Vec<anyhow::Result<StreamChunk>>),
     }
 
@@ -625,6 +634,7 @@ mod tests {
                 .expect("sampler called chat_stream more times than scripted");
             match script {
                 Script::EstablishFail(msg) => Err(anyhow::anyhow!(msg.to_string())),
+                Script::EstablishError(error) => Err(error),
                 Script::Chunks(items) => Ok(Box::pin(futures::stream::iter(items))),
             }
         }
@@ -654,6 +664,50 @@ mod tests {
 
     fn stream_err(msg: &str) -> anyhow::Result<StreamChunk> {
         Err(anyhow::anyhow!(msg.to_string()))
+    }
+
+    #[tokio::test]
+    async fn typed_no_replay_survives_context_at_establish_and_after_partial_output() {
+        for establishing in [true, false] {
+            let source = std::io::Error::other("connection reset");
+            let marker = crate::provider::NonRetryableProviderError::new(source);
+            assert_eq!(marker.to_string(), "connection reset");
+            assert_eq!(
+                std::error::Error::source(&marker).unwrap().to_string(),
+                "connection reset"
+            );
+            let error = anyhow::Error::new(marker).context("request interrupted");
+            assert!(!classify_provider_error(&error).retryable());
+            let script = if establishing {
+                Script::EstablishError(error)
+            } else {
+                Script::Chunks(vec![delta("partial"), Err(error)])
+            };
+            let primary = ScriptedProvider::of(vec![script]);
+            let fallback = ScriptedProvider::of(vec![]);
+            let mut sampler = Sampler::new(primary.clone());
+            sampler.set_fallbacks(vec![("fallback".into(), fallback.clone())]);
+            let mut chunks = Vec::new();
+            let mut events = Vec::new();
+            let result = sampler
+                .sample(
+                    req(),
+                    &[],
+                    |c| chunks.push(c.clone()),
+                    |e| events.push(e.clone()),
+                    || {},
+                )
+                .await;
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("fatal: request interrupted"));
+            assert_eq!(primary.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fallback.calls.load(Ordering::SeqCst), 0);
+            assert!(events.is_empty());
+            assert_eq!(chunks.len(), usize::from(!establishing));
+        }
+        assert!(classify_provider_error(&anyhow::anyhow!("connection reset")).retryable());
     }
 
     /// A model that thinks silently for longer than the idle ceiling keeps the

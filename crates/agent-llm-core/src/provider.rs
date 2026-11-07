@@ -14,6 +14,32 @@ use crate::types::{ChatMessage, StreamChunk};
 
 pub type BoxStream<T> = Pin<Box<dyn Stream<Item = anyhow::Result<T>> + Send>>;
 
+/// Marks a request failure that the sampler must return without replay.
+#[derive(Debug)]
+pub struct NonRetryableProviderError {
+    source: anyhow::Error,
+}
+
+impl NonRetryableProviderError {
+    pub fn new(source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NonRetryableProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.source, f)
+    }
+}
+
+impl std::error::Error for NonRetryableProviderError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 /// Per-model wire settings resolved from config and carried on every request.
 ///
 /// The provider instance owns *provider-level* configuration (base URL, key,
