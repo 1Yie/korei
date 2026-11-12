@@ -4,6 +4,45 @@ The agent loop dispatches tools and manages context, hooks and subagents.
 Providers, tools and host policy enter through the contracts exported by
 [`src/lib.rs`](src/lib.rs).
 
+## Invocation gateway
+
+[`invocation`](src/invocation.rs) exposes a turn-borrowed gateway for discovery,
+authorization, execution and audit. Hosts create an `InvocationTurn` through
+`Engine::begin_invocation_turn` and obtain handles with
+`Engine::invocation_gateway`. Handles for one turn share policy, mutation and
+approval serialization. Discovery follows the live mode and registry; dispatch
+rechecks tool identity and permissions after asynchronous authorization work.
+ReAct and nested batch calls use this same invocation path. Child agents invoke
+tools under their own engine permissions.
+
+The gateway validates arguments against bounded local JSON schemas, including
+arguments changed by hooks. Reviews, staged preparation, scope grants and
+publication retain their authorization boundaries. Critical operations require
+human approval; a scope grant can trigger a separate tool approval when current
+policy requires it.
+
+Hosts requiring durable audit provide an `AuditSink`. Its begin and pre-effect
+records must succeed before the associated operation proceeds. Phase and
+authorization fields distinguish preparation from an approved write. Audit
+waits are bounded; finish has a separate cleanup budget so cancellation can still
+settle the invocation. A finish error preserves the indication that effects may
+already have occurred. The host owns persistence and reconciliation after an
+indeterminate write. An invocation without a sink provides outcome metadata
+without durable audit storage.
+
+`InvocationOutcome` preserves the complete tool result and media. Its audit
+preview is bounded separately; hosts retain raw results before preparing a
+model-facing projection. `InvocationAudit::stop_reason` distinguishes a negative
+human verdict from policy denial, approval timeout, invocation deadline and
+cancellation. Hosts detect explicit refusal through `UserRejected` and its
+request ID. The `denied` flag is a broader ReAct turn-suppression hint.
+
+The gateway regression suite covers these boundaries:
+
+```sh
+nice -n 10 cargo test -p agent-kernel --test invocation_gateway --test approval_timeout --test cancel_running_tool
+```
+
 ## Tool invocation events
 
 [`UiEvent`](../agent-ipc/src/events.rs) correlates queued, started and finished

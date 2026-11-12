@@ -14,5 +14,7 @@ pub mod engine;
 pub mod hooks;
 pub mod permissions;
 pub mod plugins;
+pub(crate) use agent_tool::schema;
 pub mod tools;
 pub mod turn_policy;
+pub use engine::invocation;

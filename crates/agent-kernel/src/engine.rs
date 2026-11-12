@@ -9,8 +9,11 @@
 //! returned tool calls, appends their results as `tool` messages and re-samples
 //! until a turn ends with none pending.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
+
+#[path = "invocation.rs"]
+pub mod invocation;
 
 use agent_ipc::{AgentState, UiEvent};
 use agent_llm_core::sampler::{SampleRequest, Sampler, SamplerEvent};
@@ -19,7 +22,7 @@ use tokio::sync::mpsc;
 use tracing::instrument;
 
 use crate::compaction::{self, CompactionSuppressor};
-use crate::permissions::{Decision, PermissionGate};
+use crate::permissions::PermissionGate;
 use crate::tools::{ToolCtx, ToolRegistry};
 
 /// The engine's observable side — channels + sink for UI events.
@@ -47,11 +50,6 @@ const CANCEL_ERR: &str = "turn cancelled by user";
 
 /// The single system line shown for a cancelled turn.
 const CANCEL_TEXT: &str = "已被用户中断";
-
-/// How often a running tool's cancel flag is polled. A blocking `bash` has to
-/// stop within a fraction of a second of the user hitting Cancel, not at its
-/// own timeout.
-const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How long an approval card may stay unanswered before the kernel denies the
 /// call itself — a UI that never answers must not park the turn forever.
@@ -105,6 +103,7 @@ enum DecisionWait {
     Cancelled,
     /// Nobody answered within `approval_timeout`.
     TimedOut,
+    InvocationDeadline,
 }
 
 /// The model-facing text for an approval that ran out the clock. The model
@@ -127,29 +126,6 @@ fn approval_timeout_text(name: &str, secs: &str, repeated: bool) -> String {
 
 /// The approval card's short UI line when it timed out.
 const APPROVAL_TIMEOUT_UI: &str = "审批超时，已自动拒绝";
-
-/// Await `fut`, giving up as soon as the user cancels.
-///
-/// Dropping the future IS the kill: every sandbox backend spawns its child
-/// with `kill_on_drop`, and bwrap runs with `--unshare-pid --die-with-parent`,
-/// so a long build dies with the dropped future instead of running on after
-/// the turn was abandoned.
-async fn until_cancelled<F: std::future::Future>(
-    cancel: &std::sync::atomic::AtomicBool,
-    fut: F,
-) -> Option<F::Output> {
-    let mut fut = std::pin::pin!(fut);
-    loop {
-        tokio::select! {
-            out = &mut fut => return Some(out),
-            _ = tokio::time::sleep(CANCEL_POLL) => {
-                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    return None;
-                }
-            }
-        }
-    }
-}
 
 /// Per-turn outcome handed back to `SessionActor`.
 #[derive(Debug)]
@@ -260,9 +236,6 @@ pub struct Engine {
     /// Tools the user denied via an approval card this turn — same provenance
     /// role as `steers_this_turn` for `TurnOutcome::denials`.
     denials_this_turn: Vec<String>,
-    /// Approvals that timed out this turn, keyed by tool name + canonical
-    /// args: the same call is not shown a second card that nobody will answer.
-    timed_out_approvals: HashSet<(String, String)>,
     /// Permission gate consulted before every tool dispatch.
     permissions: Arc<std::sync::RwLock<PermissionGate>>,
     /// Decision slot shared with SessionActor — the engine can't hold a
@@ -335,7 +308,6 @@ impl Engine {
             steer_queue: VecDeque::new(),
             steers_this_turn: Vec::new(),
             denials_this_turn: Vec::new(),
-            timed_out_approvals: HashSet::new(),
             permissions: Arc::new(std::sync::RwLock::new(PermissionGate::from_mode_str(
                 "default",
             ))),
@@ -745,7 +717,6 @@ impl Engine {
         // Fresh provenance record for this turn — see `TurnOutcome::steers`.
         self.steers_this_turn.clear();
         self.denials_this_turn.clear();
-        self.timed_out_approvals.clear();
         self.push_user_message(io, history, user_text, images);
         self.run_rounds(io, history, false).await
     }
@@ -764,7 +735,6 @@ impl Engine {
     ) -> Result<TurnOutcome, String> {
         self.steers_this_turn.clear();
         self.denials_this_turn.clear();
-        self.timed_out_approvals.clear();
         for text in notices {
             history.push(ChatMessage::host_notice(text));
         }
@@ -824,7 +794,7 @@ impl Engine {
         // `goal_complete`/`submit_plan` from an earlier turn must not
         // short-circuit this one (the contracts are per-turn: each goal
         // prompt ends declared).
-        self.policy.begin_turn();
+        let invocation_turn = self.begin_invocation_turn();
 
         loop {
             // P0-C4: cooperative cancel — checked at the top of every
@@ -1329,624 +1299,35 @@ impl Engine {
             }
 
             for (call_idx, call) in calls.iter().enumerate() {
-                // P0-C4: cancel between tool dispatches — a destructive tool
-                // must not fire after the user already hit Cancel.
-                if io.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                let outcome = self
+                    .invocation_gateway(io, &invocation_turn, None)
+                    .invoke_queued(invocation::InvocationRequest::new(call.clone()))
+                    .await;
+                tool_calls_run += usize::from(outcome.attempted);
+                if outcome.denied {
+                    self.denials_this_turn.push(call.name.clone());
+                }
+                let cancelled = outcome.status == invocation::InvocationStatus::Cancelled;
+                let message = if outcome.ok() {
+                    ChatMessage::tool_result(call.id.clone(), outcome.content)
+                } else {
+                    ChatMessage::tool_result_err(call.id.clone(), outcome.content)
+                };
+                let message = if outcome.images.is_empty() || !self.supports_images() {
+                    message
+                } else {
+                    message.tool_result_with_images(outcome.images)
+                };
+                history.push(message.with_duration_ms(Some(outcome.audit.duration_ms)));
+                if cancelled {
                     return self.abort_cancelled(
                         io,
                         history,
                         &calls,
-                        call_idx,
+                        call_idx + 1,
                         "cancelled before dispatch",
                     );
                 }
-                // Skip degenerate calls — a text-protocol echo can produce an
-                // empty-name or empty-args call that must never dispatch
-                // (it'd surface as `unknown tool ''` and poison history).
-                if call.name.trim().is_empty() {
-                    // Unreachable since the pre-persist filter above — kept
-                    // as a pairing guard: a skipped call must still emit a
-                    // tool row, or its `tool_calls` entry dangles and strict
-                    // providers reject the next request (deepseek 400).
-                    let msg = "skipped malformed empty tool call".to_string();
-                    let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        ok: false,
-                        content: msg.clone(),
-                        ui_type: None,
-                        parent: None,
-                        child_id: None,
-                    });
-                    history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                    continue;
-                }
-                tool_calls_run += 1;
-
-                let args: serde_json::Value = serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({ "_malformed": call.arguments }));
-
-                // Primary locator (path/command/pattern) for the tool call —
-                // preserved in full so audit/confirmation tooltips can display
-                // the complete command or path without losing critical arguments.
-                // A tool that reviews its own calls (a desktop tool says exactly
-                // what it will do) supplies the summary; the rest get the
-                // generic locator below.
-                let mut review = self
-                    .active_registry()
-                    .spec(&call.name)
-                    .and_then(|s| s.review.clone())
-                    .map(|f| f(&args, &self.ctx))
-                    .unwrap_or_default();
-                let review_summary = review.summary.take();
-                let args_preview = review_summary
-                    .clone()
-                    .unwrap_or_else(|| args_preview_of(&args));
-                let _ = io.ui_tx.send(UiEvent::ToolCallStarted {
-                    name: call.name.clone(),
-                    args_preview,
-                    call_id: call.id.clone(),
-                    parent: None,
-                    child_id: None,
-                });
-                self.set_state(
-                    io,
-                    AgentState::ExecutingTool {
-                        tool_name: call.name.clone(),
-                    },
-                );
-
-                // before_tool hooks (veto/mutate, pre-gate)
-                let mut call_mut = call.clone();
-                if let Err(msg) = self.hooks.run_before_tool(&mut call_mut).await {
-                    let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        ok: false,
-                        content: msg.clone(),
-                        ui_type: None,
-                        parent: None,
-                        child_id: None,
-                    });
-                    history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                    continue;
-                }
-                call_mut.id.clone_from(&call.id);
-                let call = &call_mut; // hooks may have rewritten args
-                                      // Gate + dispatch must see the *rewritten* arguments; `args`
-                                      // above is the model's own request, kept for the step card's
-                                      // preview and the audit trail.
-                let args: serde_json::Value = serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({ "_malformed": call.arguments }));
-
-                // Permission gate before dispatch
-                let registry = self.active_registry();
-                let is_readonly = registry.is_readonly(&call.name);
-                // A tool's declared execution class drives the permission mode.
-                let class = registry.spec(&call.name).map(|s| s.class);
-                // Anything not declared read-only may write, and a plugin/MCP
-                // tool has no built-in spec at all — so the baseline keys off
-                // `readonly`, not `class`, and an unknown name counts as a write.
-                // The baseline itself is the installed policy's business: it is
-                // taken inside `before_dispatch`, lazily before the first write.
-                let diff_summary = review_summary.clone().unwrap_or_else(|| {
-                    args.get("path")
-                        .and_then(|v| v.as_str())
-                        .map(|p| format!("{p}"))
-                        .unwrap_or_else(|| call.name.clone())
-                });
-
-                // P1-c: staged writers are dispatched EARLY — they return a
-                // `Commit` instead of acting inside the tool, so we can
-                // show the REAL diff + fuzzy flag on the approval card and only
-                // commit the write after the user approves. Read-only and bash
-                // tools keep the classic gate→dispatch flow (they have side
-                // effects we can't dry-run). `ToolSpec::staged` is the single
-                // source of truth, and documents why it is not
-                // `ToolClass::WorkspaceMutation` (serena).
-                let is_write = self
-                    .active_registry()
-                    .spec(&call.name)
-                    .is_some_and(|s| s.staged);
-
-                // Dry-run a staged tool to harvest diff/fuzzy/commit.
-                // `dispatch` on these tools is side-effect-free (returns a
-                // Commit), so it's safe to run pre-approval.
-                let staged: Option<crate::tools::registry::ToolResult> = if is_write {
-                    match self
-                        .active_registry()
-                        .dispatch(&call.name, args.clone(), self.ctx.clone())
-                        .await
-                    {
-                        Ok(res) => Some(res),
-                        Err(e) => {
-                            // A write's path is checked by this dry run, so a
-                            // refusal the host can lift becomes a question —
-                            // and one grant makes the same call go through.
-                            let retried = match &e {
-                                agent_tool::ToolError::OutOfScope { path, suggestion } => Some(
-                                    self.ask_scope_grant(io, call, path, suggestion.as_deref())
-                                        .await,
-                                ),
-                                _ => None,
-                            };
-                            let outcome = match retried {
-                                Some(Ok(())) => {
-                                    self.active_registry()
-                                        .dispatch(&call.name, args.clone(), self.ctx.clone())
-                                        .await
-                                }
-                                Some(Err(msg)) => Err(agent_tool::ToolError::Failed(msg)),
-                                None => Err(e),
-                            };
-                            match outcome {
-                                Ok(res) => Some(res),
-                                Err(e) => {
-                                    let msg = e.to_string();
-                                    let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                                        call_id: call.id.clone(),
-                                        name: call.name.clone(),
-                                        ok: false,
-                                        content: msg.clone(),
-                                        ui_type: None,
-                                        parent: None,
-                                        child_id: None,
-                                    });
-                                    history
-                                        .push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    None
-                };
-                let real_diff = staged
-                    .as_ref()
-                    .map(|r| r.content.clone())
-                    .or_else(|| review_summary.clone())
-                    .unwrap_or_else(|| {
-                        args.get("replace")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string()
-                    });
-                let real_fuzzy = staged.as_ref().map(|r| r.fuzzy).unwrap_or(false);
-
-                // A call the tool already knows cannot run is refused here,
-                // before the card: an approval for it would change nothing, and
-                // a question with only one possible answer is noise.
-                if let Some(reason) = review.deny.take() {
-                    self.denials_this_turn.push(call.name.clone());
-                    let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        ok: false,
-                        content: reason.clone(),
-                        ui_type: None,
-                        parent: None,
-                        child_id: None,
-                    });
-                    history.push(ChatMessage::tool_result_err(call.id.clone(), reason));
-                    continue;
-                }
-
-                let action = review.action.take();
-                let decision = {
-                    let gate = self.permissions.read().unwrap_or_else(|e| e.into_inner());
-                    let d = gate.decide(
-                        &call.name,
-                        class,
-                        is_readonly,
-                        review.risk,
-                        diff_summary.clone(),
-                    );
-                    match &action {
-                        Some(a) => gate.escalate(&call.name, a, d, diff_summary.clone()),
-                        None => d,
-                    }
-                };
-
-                match decision {
-                    Decision::Deny { reason } => {
-                        let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                            call_id: call.id.clone(),
-                            name: call.name.clone(),
-                            ok: false,
-                            content: reason.clone(),
-                            ui_type: None,
-                            parent: None,
-                            child_id: None,
-                        });
-                        history.push(ChatMessage::tool_result_err(call.id.clone(), reason));
-                        continue;
-                    }
-                    Decision::Ask { diff_summary } => {
-                        let fingerprint = (call.name.clone(), args.to_string());
-                        // A call whose approval already ran out the clock this
-                        // turn is not shown a second card: the same wait would
-                        // only run out again.
-                        if self.timed_out_approvals.contains(&fingerprint) {
-                            self.denials_this_turn.push(call.name.clone());
-                            let msg = approval_timeout_text(
-                                &call.name,
-                                &crate::tools::host_slots::secs_label(self.approval_timeout),
-                                true,
-                            );
-                            let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                                call_id: call.id.clone(),
-                                name: call.name.clone(),
-                                ok: false,
-                                content: APPROVAL_TIMEOUT_UI.to_string(),
-                                ui_type: None,
-                                parent: None,
-                                child_id: None,
-                            });
-                            history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                            continue;
-                        }
-                        // Acquire any platform grant before asking for in-app
-                        // approval. A refusal ends the call before the card.
-                        if let Some(prepare) = review.prepare.take() {
-                            if let Err(msg) = prepare.await {
-                                let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                                    call_id: call.id.clone(),
-                                    name: call.name.clone(),
-                                    ok: false,
-                                    content: msg.clone(),
-                                    ui_type: None,
-                                    parent: None,
-                                    child_id: None,
-                                });
-                                history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                                continue;
-                            }
-                        }
-                        // Pause in AwaitingToolConfirmation; the UI's
-                        // ToolDecision writes the shared slot via
-                        // decision_slot(). P1-a: a fresh request_id ties
-                        // this pending approval to its verdict — a stale
-                        // decision can't approve this tool.
-                        let request_id = next_request_id();
-                        let _route = self.route_child_approval(request_id);
-                        self.set_state(
-                            io,
-                            AgentState::AwaitingToolConfirmation {
-                                tool_name: call.name.clone(),
-                                diff_summary: diff_summary.clone(),
-                            },
-                        );
-                        // P1-c: show the REAL diff + fuzzy flag the staged
-                        // run produced — the card reflects what gets written.
-                        let _ = io.ui_tx.send(UiEvent::ApprovalRequested {
-                            request_id,
-                            tool_name: call.name.clone(),
-                            diff: real_diff.clone(),
-                            fuzzy: real_fuzzy,
-                            actions: Vec::new(),
-                            child_id: self.child_id(),
-                        });
-                        let wait = self.wait_for_decision(request_id, &io.cancel).await;
-                        self.set_state(
-                            io,
-                            AgentState::ExecutingTool {
-                                tool_name: call.name.clone(),
-                            },
-                        );
-                        match wait {
-                            DecisionWait::Verdict(v) if v.approved => {}
-                            DecisionWait::Verdict(_) => {
-                                let msg = format!("user denied {call_name}", call_name = call.name);
-                                self.denials_this_turn.push(call.name.clone());
-                                let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                                    call_id: call.id.clone(),
-                                    name: call.name.clone(),
-                                    ok: false,
-                                    content: msg.clone(),
-                                    ui_type: None,
-                                    parent: None,
-                                    child_id: None,
-                                });
-                                history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                                continue;
-                            }
-                            // A cancel is the user abandoning the turn, not a
-                            // refusal of this tool — nothing to record as a denial.
-                            DecisionWait::Cancelled => {
-                                let msg = format!(
-                                    "{} was not run — the turn was cancelled while awaiting \
-                                     approval",
-                                    call.name
-                                );
-                                let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                                    call_id: call.id.clone(),
-                                    name: call.name.clone(),
-                                    ok: false,
-                                    content: msg.clone(),
-                                    ui_type: None,
-                                    parent: None,
-                                    child_id: None,
-                                });
-                                history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                                continue;
-                            }
-                            DecisionWait::TimedOut => {
-                                self.denials_this_turn.push(call.name.clone());
-                                self.timed_out_approvals.insert(fingerprint);
-                                let msg = approval_timeout_text(
-                                    &call.name,
-                                    &crate::tools::host_slots::secs_label(self.approval_timeout),
-                                    false,
-                                );
-                                let _ = io.ui_tx.send(UiEvent::ApprovalTimedOut {
-                                    request_id,
-                                    child_id: self.child_id(),
-                                });
-                                let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                                    call_id: call.id.clone(),
-                                    name: call.name.clone(),
-                                    ok: false,
-                                    content: APPROVAL_TIMEOUT_UI.to_string(),
-                                    ui_type: None,
-                                    parent: None,
-                                    child_id: None,
-                                });
-                                history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                                continue;
-                            }
-                        }
-                        // K3: approval and cancel/policy change can race —
-                        // `wait_for_decision` returns a verdict that was already
-                        // in the slot. Re-check both right before side effects.
-                        let post_deny: Option<String> = if io
-                            .cancel
-                            .load(std::sync::atomic::Ordering::Relaxed)
-                        {
-                            Some(format!("{} cancelled before it ran", call.name))
-                        } else if let Decision::Deny { reason } = {
-                            let gate = self.permissions.read().unwrap_or_else(|e| e.into_inner());
-                            let d = gate.decide(
-                                &call.name,
-                                class,
-                                is_readonly,
-                                review.risk,
-                                diff_summary.clone(),
-                            );
-                            match &action {
-                                Some(a) => {
-                                    // A revoke that landed while the card was open
-                                    // still wins; an action that was approved by
-                                    // this card is not re-asked here.
-                                    match gate.escalate(&call.name, a, d, diff_summary.clone()) {
-                                        Decision::Ask { .. } => Decision::Allow,
-                                        d => d,
-                                    }
-                                }
-                                None => d,
-                            }
-                        } {
-                            Some(reason)
-                        } else {
-                            None
-                        };
-                        if let Some(msg) = post_deny {
-                            let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                                call_id: call.id.clone(),
-                                name: call.name.clone(),
-                                ok: false,
-                                content: msg.clone(),
-                                ui_type: None,
-                                parent: None,
-                                child_id: None,
-                            });
-                            history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                            continue;
-                        }
-                    }
-                    Decision::Allow => {}
-                }
-
-                if let Some(msg) = self.policy.before_dispatch(&call.name, is_readonly).await {
-                    let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                        call_id: call.id.clone(),
-                        name: call.name.clone(),
-                        ok: false,
-                        content: msg.clone(),
-                        ui_type: None,
-                        parent: None,
-                        child_id: None,
-                    });
-                    history.push(ChatMessage::tool_result_err(call.id.clone(), msg));
-                    continue;
-                }
-
-                // Staged write tools already hold their result; dispatch the
-                // rest now (read-only/bash). The clock starts here — it
-                // covers dispatch + deferred-write commits + after_tool
-                // hooks, i.e. everything the row's `· 3s` label meant live.
-                let call_started = std::time::Instant::now();
-                let (mut content, ui_type, mut ok, commit, result_images) = if let Some(res) =
-                    staged
-                {
-                    let ui_type = res.ui_type.map(|s| s.to_string());
-                    (res.content, ui_type, true, res.commit, res.images)
-                } else {
-                    // A cancel-aware tool watches `ctx.cancel` itself and ends
-                    // with its own terminal text — which is the result that
-                    // has to be recorded (a cancelled child names itself
-                    // there). Racing it here would drop that text for a
-                    // generic line, and the UI could no longer tie the card
-                    // to the child's transcript.
-                    let cancel_aware = registry.spec(&call.name).is_some_and(|s| s.cancel_aware);
-                    let dispatched = if cancel_aware {
-                        self.active_registry()
-                            .dispatch(&call.name, args.clone(), self.ctx.clone())
-                            .await
-                    } else {
-                        // A `bash` (or the test suite under it) can run for
-                        // minutes. Race it against the flag so Cancel lands
-                        // now, not after the tool's own timeout.
-                        let Some(dispatched) = until_cancelled(
-                            &io.cancel,
-                            self.active_registry().dispatch(
-                                &call.name,
-                                args.clone(),
-                                self.ctx.clone(),
-                            ),
-                        )
-                        .await
-                        else {
-                            return self.abort_cancelled(
-                                io,
-                                history,
-                                &calls,
-                                call_idx,
-                                "cancelled while running",
-                            );
-                        };
-                        dispatched
-                    };
-                    match dispatched {
-                        Ok(res) => (
-                            res.content,
-                            res.ui_type.map(|s| s.to_string()),
-                            true,
-                            res.commit,
-                            res.images,
-                        ),
-                        Err(e) => {
-                            // Built-in miss → try the plugin router (built-in
-                            // names are reserved and can't be shadowed).
-                            // External tools use the same result contract.
-                            // Plan mode dispatches read-only built-ins only.
-                            // A call that is not staged has no dry run: its
-                            // path is checked when it runs. A refusal the host
-                            // can lift becomes the same grant question, then
-                            // one more attempt with the wider reach.
-                            if let agent_tool::ToolError::OutOfScope { path, suggestion } = &e {
-                                let granted = self
-                                    .ask_scope_grant(io, call, path, suggestion.as_deref())
-                                    .await
-                                    .is_ok();
-                                if granted {
-                                    match self
-                                        .active_registry()
-                                        .dispatch(&call.name, args.clone(), self.ctx.clone())
-                                        .await
-                                    {
-                                        Ok(res) => (
-                                            res.content,
-                                            res.ui_type.map(|s| s.to_string()),
-                                            true,
-                                            res.commit,
-                                            res.images,
-                                        ),
-                                        Err(e) => (e.to_string(), None, false, None, Vec::new()),
-                                    }
-                                } else {
-                                    (e.to_string(), None, false, None, Vec::new())
-                                }
-                            } else if !self.plugins_allowed() {
-                                (e.to_string(), None, false, None, Vec::new())
-                            } else if let Some(mgr) = self.plugins() {
-                                // Report the plugin's own failure. Its message names the
-                                // real cause (server error, dead bridge); the built-in
-                                // "unknown tool" text would send the model hunting for a
-                                // tool that exists. A plugin round-trip is a network
-                                // wait too, so it gets the same cancel race.
-                                let Some(routed) = until_cancelled(
-                                    &io.cancel,
-                                    mgr.dispatch_tool_call(&call.name, args),
-                                )
-                                .await
-                                else {
-                                    return self.abort_cancelled(
-                                        io,
-                                        history,
-                                        &calls,
-                                        call_idx,
-                                        "cancelled while running",
-                                    );
-                                };
-                                match routed {
-                                    Some(Ok(out)) => (
-                                        out.content,
-                                        out.ui_type.map(|s| s.to_string()),
-                                        true,
-                                        out.commit,
-                                        out.images,
-                                    ),
-                                    // An unowned name preserves the registry's real error.
-                                    None => (e.to_string(), None, false, None, Vec::new()),
-                                    Some(Err(msg)) => (msg, None, false, None, Vec::new()),
-                                }
-                            } else {
-                                (e.to_string(), None, false, None, Vec::new())
-                            }
-                        }
-                    }
-                };
-
-                // P1-c: apply the effect the tool staged — the engine owns it
-                // so it lands only after the permission decision. `verify`
-                // first (the preview must still hold), then `apply`; either
-                // failing abandons the commit and fails the call with the
-                // tool's own reason. What the effect IS stays the tool's
-                // business — the engine never looks inside.
-                if let Some(commit) = commit {
-                    let agent_tool::Commit { verify, apply } = commit;
-                    match verify() {
-                        Err(reason) => {
-                            ok = false;
-                            content = reason;
-                        }
-                        Ok(()) => {
-                            if let Err(reason) = apply.await {
-                                ok = false;
-                                content = reason;
-                            }
-                        }
-                    }
-                }
-
-                // after_tool hooks (may mutate output)
-                self.hooks.run_after_tool(&call, &mut content).await;
-
-                let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    ok,
-                    content: content.clone(),
-                    ui_type,
-                    parent: None,
-                    child_id: None,
-                });
-
-                // `ok` survives into the snapshot via `is_error` so a
-                // reloaded view replays the red capsule instead of a green
-                // one — the live `ToolCallFinished.ok` carried it.
-                let result_msg = if ok {
-                    ChatMessage::tool_result(call.id.clone(), content)
-                } else {
-                    ChatMessage::tool_result_err(call.id.clone(), content)
-                };
-                // A tool that produced images (a screenshot) hands them to the
-                // model alongside its text. Adapters encode them per their wire
-                // — Anthropic carries real blocks inside `tool_result`, the
-                // text-only tool protocols get a synthetic user turn after it.
-                // Gated on vision like the composer path: a text-only model
-                // keeps the file path the tool already printed.
-                let result_msg = if result_images.is_empty() || !self.supports_images() {
-                    result_msg
-                } else {
-                    result_msg.tool_result_with_images(result_images)
-                };
-                // The call's wall time persists with the row — a replayed
-                // tools step re-derives its span from `ts - duration_ms`.
-                history.push(
-                    result_msg.with_duration_ms(Some(call_started.elapsed().as_millis() as i64)),
-                );
             }
 
             // If we have reached or exceeded the tool limit, force the next round to be a synthesis round without tools
@@ -2180,23 +1561,37 @@ impl Engine {
     /// Without a host slot this stays a plain refusal: the kernel has no idea
     /// what a directory grant would even mean.
     async fn ask_scope_grant(
-        &mut self,
-        io: &mut EngineIo,
+        &self,
+        io: &EngineIo,
         call: &agent_llm_core::types::ToolCall,
         path: &str,
         suggestion: Option<&str>,
-    ) -> Result<(), String> {
+        readonly: bool,
+        deadline: Option<std::time::Instant>,
+        status: &mut invocation::InvocationStatus,
+        audit: &mut invocation::InvocationAudit,
+    ) -> Result<(String, String, u64), String> {
         const LINK_SESSION: &str = "link:session";
         const LINK_PERSIST: &str = "link:workspace";
         if !self.ctx.has_scope_grant() {
             return Err(format!("path escapes workspace: {path}"));
+        }
+        if !self
+            .permissions
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .can_ask()
+        {
+            *status = invocation::InvocationStatus::Denied;
+            return Err(
+                "directory access requires human approval — unavailable in this context".into(),
+            );
         }
         // A read that escaped asks for read access, not for a writable
         // checkout: the person answering this card was reading a file, and
         // widening it to "edit anything under that project" is a grant they
         // never saw. A write tool — and `bash`, which can write — still asks
         // for the wider grant.
-        let readonly = self.active_registry().is_readonly(&call.name);
         let access = if readonly { "read" } else { "readwrite" };
         let grant_dir = suggestion.map_or_else(|| path.to_string(), str::to_string);
         let scope_word = if readonly { "只读" } else { "读写" };
@@ -2223,6 +1618,7 @@ impl Engine {
         // was refused.
         let diff = format!("关联目录：{grant_dir}（{scope_word}）\n被拒绝的路径：{path}");
         let request_id = next_request_id();
+        audit.scope_approval_request_id = Some(request_id);
         let _route = self.route_child_approval(request_id);
         self.set_state(
             io,
@@ -2239,7 +1635,9 @@ impl Engine {
             actions,
             child_id: self.child_id(),
         });
-        let wait = self.wait_for_decision(request_id, &io.cancel).await;
+        let wait = self
+            .wait_for_decision(request_id, &io.cancel, deadline)
+            .await;
         self.set_state(
             io,
             AgentState::ExecutingTool {
@@ -2249,9 +1647,20 @@ impl Engine {
         let verdict = match wait {
             DecisionWait::Verdict(v) => v,
             DecisionWait::Cancelled => {
+                *status = invocation::InvocationStatus::Cancelled;
+                audit.stop_reason = Some(invocation::InvocationStopReason::Cancelled);
                 return Err(format!("access grant for {path} was cancelled"));
             }
+            DecisionWait::InvocationDeadline => {
+                *status = invocation::InvocationStatus::TimedOut;
+                audit.stop_reason = Some(invocation::InvocationStopReason::InvocationDeadline);
+                return Err("invocation deadline exceeded".into());
+            }
             DecisionWait::TimedOut => {
+                *status = invocation::InvocationStatus::TimedOut;
+                audit.stop_reason = Some(invocation::InvocationStopReason::ApprovalTimedOut {
+                    request_id: Some(request_id),
+                });
                 let _ = io.ui_tx.send(UiEvent::ApprovalTimedOut {
                     request_id,
                     child_id: self.child_id(),
@@ -2264,6 +1673,8 @@ impl Engine {
             }
         };
         if !verdict.approved {
+            *status = invocation::InvocationStatus::Denied;
+            audit.stop_reason = Some(invocation::InvocationStopReason::UserRejected { request_id });
             return Err(format!("user did not grant access to {path}"));
         }
         let Some(action) = verdict.action else {
@@ -2272,11 +1683,7 @@ impl Engine {
         if action != LINK_SESSION && action != LINK_PERSIST {
             return Err(format!("`{action}` is not a grant this session offers"));
         }
-        match self.ctx.grant_scope(&action, path, access) {
-            Some(Ok(())) => Ok(()),
-            Some(Err(msg)) => Err(msg),
-            None => Err("this host cannot link directories".into()),
-        }
+        Ok((action, access.into(), request_id))
     }
 
     /// Poll the shared decision slot until SessionActor writes a verdict
@@ -2293,15 +1700,29 @@ impl Engine {
         &self,
         request_id: u64,
         cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+        invocation_deadline: Option<std::time::Instant>,
     ) -> DecisionWait {
         let deadline = (!self.approval_timeout.is_zero())
-            .then(|| std::time::Instant::now() + self.approval_timeout);
+            .then(|| tokio::time::Instant::now() + self.approval_timeout);
         loop {
             // Poison-safe: a panicked writer must not deadlock the engine.
             // Take the verdict out of the slot in a short scope so the
             // MutexGuard is never held across `.await` (not `Send`).
             let verdict = {
                 let mut slot = self.decision.lock().unwrap_or_else(|e| e.into_inner());
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    slot.take();
+                    return DecisionWait::Cancelled;
+                }
+                if invocation_deadline.is_some_and(|d| tokio::time::Instant::now().into_std() >= d)
+                {
+                    slot.take();
+                    return DecisionWait::InvocationDeadline;
+                }
+                if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
+                    slot.take();
+                    return DecisionWait::TimedOut;
+                }
                 // `take` — the verdict is not `Copy`, and a stale one must not
                 // stay in the slot where it could answer a later request.
                 match slot.take() {
@@ -2313,20 +1734,14 @@ impl Engine {
             if let Some(verdict) = verdict {
                 return DecisionWait::Verdict(verdict);
             }
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                return DecisionWait::Cancelled;
+            let mut wake = tokio::time::Instant::now() + std::time::Duration::from_millis(50);
+            if let Some(d) = deadline {
+                wake = wake.min(d);
             }
-            if deadline.is_some_and(|d| std::time::Instant::now() > d) {
-                // Close the card under the slot's own lock: whatever arrives
-                // after this point is a late click and is discarded.
-                let _ = self
-                    .decision
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
-                return DecisionWait::TimedOut;
+            if let Some(d) = invocation_deadline {
+                wake = wake.min(d.into());
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep_until(wake).await;
         }
     }
 

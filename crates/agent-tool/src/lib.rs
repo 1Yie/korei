@@ -234,6 +234,8 @@ pub enum CallRisk {
     Readonly,
     /// Ask above the mode default unless the tool is explicitly allowed.
     RequiresApproval,
+    /// Require a fresh human decision even under allow rules or bypass mode.
+    Critical,
 }
 
 /// What a tool says about one call *before* it is approved — everything the

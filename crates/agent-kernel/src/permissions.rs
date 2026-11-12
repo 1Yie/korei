@@ -195,6 +195,10 @@ impl PermissionGate {
         self.mode
     }
 
+    pub(crate) fn can_ask(&self) -> bool {
+        self.mode != PermissionMode::DontAsk && !self.headless
+    }
+
     /// Merge repo-local rules (`.agent/config.toml` → deny/ask/allow lists).
     pub fn merge_rules(&mut self, rules: PermissionRules) {
         self.rules.deny.extend(rules.deny);
@@ -337,6 +341,17 @@ impl PermissionGate {
         if self.rules.deny.contains(tool_name) {
             return Decision::Deny {
                 reason: format!("`{tool_name}` denied by rule"),
+            };
+        }
+        if risk == CallRisk::Critical {
+            return if self.mode == PermissionMode::DontAsk || self.headless {
+                Decision::Deny {
+                    reason: format!("`{tool_name}` requires human approval"),
+                }
+            } else {
+                Decision::Ask {
+                    diff_summary: diff_summary.into(),
+                }
             };
         }
         // A call's risk can require approval above the mode default.
@@ -484,11 +499,23 @@ mod tests {
     fn a_child_asks_only_when_the_user_can_answer() {
         let parent = PermissionGate::new(PermissionMode::Default, PermissionRules::default());
         assert!(matches!(
-            PermissionGate::child_of(&parent, true).decide("bash", None, false, CallRisk::Normal, ""),
+            PermissionGate::child_of(&parent, true).decide(
+                "bash",
+                None,
+                false,
+                CallRisk::Normal,
+                ""
+            ),
             Decision::Ask { .. }
         ));
         assert!(matches!(
-            PermissionGate::child_of(&parent, false).decide("bash", None, false, CallRisk::Normal, ""),
+            PermissionGate::child_of(&parent, false).decide(
+                "bash",
+                None,
+                false,
+                CallRisk::Normal,
+                ""
+            ),
             Decision::Deny { .. }
         ));
     }

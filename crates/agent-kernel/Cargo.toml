@@ -22,3 +22,4 @@ schemars.workspace = true
 [dev-dependencies]
 agent-testkit = { path = "../agent-testkit" }
 async-trait.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

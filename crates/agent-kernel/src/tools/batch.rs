@@ -4,8 +4,8 @@
 //! qualify (`readonly` alone is not enough), and network items are capped lower
 //! than local ones. Results keep input order, per-item failures are reported
 //! rather than fatal, and cancellation is batch-scoped so tools that poll
-//! `ctx.cancel` actually abort. No permission gate runs: only auto-allowed
-//! specs are eligible by construction.
+//! `ctx.cancel` actually abort. Every inner call is authorized and audited by
+//! the parent invocation gateway.
 //!
 //! `screenshot` is batchable (it is an `Observation`), `computer` is not (it is
 //! `Process`). Never pair them in one batch: a `screenshot` item installs the
@@ -391,6 +391,10 @@ async fn exec(
     ctx: Arc<ToolCtx>,
     profile: Arc<BatchProfile>,
 ) -> Result<ToolResult, ToolError> {
+    let dispatcher = ctx
+        .ext
+        .get::<crate::tools::dispatch::NestedDispatcher>()
+        .ok_or_else(|| ToolError::Failed("batch_execute requires an invocation gateway".into()))?;
     let items = parse_items(args, &profile)?;
     if items.is_empty() {
         return Err(ToolError::Args("`calls` must not be empty".into()));
@@ -463,164 +467,89 @@ async fn exec(
         deadline: Instant::now() + MAX_BATCH_WALL,
         cancel: Arc::new(AtomicBool::new(false)),
     };
-    {
-        let flag = budget.cancel.clone();
-        let parent = ctx.cancel.clone();
-        let deadline = budget.deadline;
-        tokio::spawn(async move {
-            loop {
-                if Instant::now() >= deadline
-                    || parent.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
-                {
-                    flag.store(true, Ordering::Relaxed);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        });
-    }
-
     let started = Instant::now();
     let streams = items
         .into_iter()
         .zip(eligible_flags)
-        .enumerate()
-        .map(|(i, (item, flag))| {
-            let ctx = ctx.clone();
-            let call_id = format!("batch:{}", crate::engine::next_request_id());
-            let batch_cancel = budget.cancel.clone();
+        .map(|(item, eligible)| {
+            let dispatcher = dispatcher.clone();
+            let cancel = budget.cancel.clone();
             let deadline = budget.deadline;
-            let (tool, call_args) = match item {
-                ParsedItem::Call(call) => (call.tool, call.args),
-                ParsedItem::Bad { name, .. } => (name, serde_json::Value::Null),
-            };
             async move {
-                let t0 = Instant::now();
-                let out = match flag {
-                    Err(reason) => {
-                        // Rejected items still surface as child rows — the
-                        // live stream should show the same `── [i] ──`
-                        // children the result text replays, not silently
-                        // drop the ones the batch refused.
-                        if let Some(ui) = ctx.ui() {
-                            let _ = ui.send(agent_ipc::events::UiEvent::ToolCallStarted {
-                                name: tool.clone(),
-                                parent: Some("batch_execute".into()),
-                                args_preview: String::new(),
-                                call_id: call_id.clone(),
-                                child_id: None,
-                            });
-                            let _ = ui.send(agent_ipc::events::UiEvent::ToolCallFinished {
-                                call_id,
-                                name: tool.clone(),
-                                ok: false,
-                                content: reason.clone(),
-                                // `rejected` ui_type — the row renders 已拒绝,
-                                // not 已中断: the call never ran.
-                                ui_type: Some("rejected".into()),
-                                parent: Some("batch_execute".into()),
-                                child_id: None,
-                            });
-                        }
+                let started = Instant::now();
+                let (tool, call_args) = match item {
+                    ParsedItem::Call(call) => (call.tool, call.args),
+                    ParsedItem::Bad { name, .. } => (name, serde_json::Value::Null),
+                };
+                let rejection = eligible.err();
+                let result = dispatcher
+                    .invoke(
+                        agent_llm_core::types::ToolCall {
+                            id: format!("batch:{}", crate::engine::next_request_id()),
+                            name: tool.clone(),
+                            arguments: call_args.to_string(),
+                        },
+                        cancel,
+                        deadline,
+                        rejection,
+                    )
+                    .await;
+                match result {
+                    Ok(outcome) => {
+                        let status = if outcome.ok() {
+                            ItemStatus::Ok
+                        } else {
+                            match outcome.status {
+                                crate::invocation::InvocationStatus::Cancelled => {
+                                    ItemStatus::Cancelled
+                                }
+                                crate::invocation::InvocationStatus::TimedOut => {
+                                    ItemStatus::Timeout
+                                }
+                                crate::invocation::InvocationStatus::Denied => ItemStatus::Rejected,
+                                _ => ItemStatus::Error,
+                            }
+                        };
                         ItemOut {
                             tool,
-                            status: ItemStatus::Rejected,
-                            body: reason,
-                            images: Vec::new(),
-                            duration_ms: 0,
+                            status,
+                            body: outcome.content,
+                            images: outcome.images,
+                            duration_ms: started.elapsed().as_millis() as u64,
                         }
                     }
-                    Ok(spec) => {
-                        // Item ctx carries the batch flag — tools that poll
-                        // cancel abort their own blocking work too.
-                        let item_ctx = Arc::new(ctx.with_cancel(batch_cancel.clone()));
-                        if let Some(ui) = ctx.ui() {
-                            let _ = ui.send(agent_ipc::events::UiEvent::ToolCallStarted {
-                                name: tool.clone(),
-                                // Nested — the UI renders this under the
-                                // batch_execute capsule, not top-level.
-                                parent: Some("batch_execute".into()),
-                                // Items carry no queue entry: only the round's
-                                // own calls are announced ahead of dispatch.
-                                call_id: call_id.clone(),
-                                args_preview: call_args
-                                    .get("path")
-                                    .or_else(|| call_args.get("pattern"))
-                                    .or_else(|| call_args.get("url"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or_default()
-                                    .chars()
-                                    .take(120)
-                                    .collect(),
-                                child_id: None,
-                            });
-                        }
-                        let remaining = deadline.saturating_duration_since(Instant::now());
-                        let run = (spec.exec)(call_args, item_ctx);
-                        let out = match tokio::time::timeout(remaining, run).await {
-                            Err(_) => ItemOut {
-                                tool: tool.clone(),
-                                status: if batch_cancel.load(Ordering::Relaxed) {
-                                    ItemStatus::Cancelled
-                                } else {
-                                    ItemStatus::Timeout
-                                },
-                                body: "batch wall-time budget exhausted".into(),
-                                images: Vec::new(),
-                                duration_ms: t0.elapsed().as_millis() as u64,
-                            },
-                            Ok(Ok(res)) => {
-                                // Readonly tools never stage writes — a
-                                // pending_write here would be dropped by
-                                // design anyway (observations don't write).
-                                // Images are kept: a batched `screenshot` must
-                                // reach the model with the same frame a plain
-                                // call would have handed it.
-                                ItemOut {
-                                    tool: tool.clone(),
-                                    status: ItemStatus::Ok,
-                                    body: res.content,
-                                    images: res.images,
-                                    duration_ms: t0.elapsed().as_millis() as u64,
-                                }
-                            }
-                            Ok(Err(e)) => ItemOut {
-                                tool: tool.clone(),
-                                status: ItemStatus::Error,
-                                body: e.to_string(),
-                                images: Vec::new(),
-                                duration_ms: t0.elapsed().as_millis() as u64,
-                            },
-                        };
-                        if let Some(ui) = ctx.ui() {
-                            let (ok, content) = match &out.status {
-                                ItemStatus::Ok => (true, out.body.clone()),
-                                _ => (false, out.body.clone()),
-                            };
-                            let _ = ui.send(agent_ipc::events::UiEvent::ToolCallFinished {
-                                call_id,
-                                name: tool,
-                                ok,
-                                content,
-                                ui_type: None,
-                                parent: Some("batch_execute".into()),
-                                child_id: None,
-                            });
-                        }
-                        out
-                    }
-                };
-                (i, out)
+                    Err(error) => ItemOut {
+                        tool,
+                        status: ItemStatus::Error,
+                        body: error,
+                        images: Vec::new(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                    },
+                }
             }
         });
-
-    // `buffered` = bounded concurrency + INPUT order preserved — the model
-    // maps `── [i] ──` sections back to its own call list.
-    let results: Vec<ItemOut> = futures::stream::iter(streams)
+    let collected = futures::stream::iter(streams)
         .buffered(MAX_BATCH_CONCURRENCY)
-        .map(|(_, out)| out)
-        .collect()
-        .await;
+        .collect::<Vec<ItemOut>>();
+    tokio::pin!(collected);
+    let watch = async {
+        loop {
+            if Instant::now() >= budget.deadline
+                || ctx
+                    .cancel
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                budget.cancel.store(true, Ordering::Relaxed);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    let results = tokio::select! {
+        results = &mut collected => results,
+        _ = watch => collected.await,
+    };
 
     // Sectioned model-facing text — one block per call, order preserved,
     // aggregate bytes capped. Status + duration ride in every header.

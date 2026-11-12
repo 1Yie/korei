@@ -177,6 +177,10 @@ impl ToolRegistry {
         self.specs.get(name).cloned()
     }
 
+    pub(crate) fn specs(&self) -> impl Iterator<Item = &ToolSpec> {
+        self.specs.values().map(AsRef::as_ref)
+    }
+
     pub fn len(&self) -> usize {
         self.specs.len()
     }
