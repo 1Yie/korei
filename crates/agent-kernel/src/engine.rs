@@ -21,6 +21,10 @@ use agent_llm_core::types::{ChatMessage, StreamChunk, ToolCallAssembler};
 use tokio::sync::mpsc;
 use tracing::instrument;
 
+use crate::code_mode::{
+    CodeModeContext, CodeModeHandler, CodeModeOutcome, CodeModeRequest, EngineStrategy,
+    CONTROL_TOOL_NAME,
+};
 use crate::compaction::{self, CompactionSuppressor};
 use crate::permissions::PermissionGate;
 use crate::tools::{ToolCtx, ToolRegistry};
@@ -213,6 +217,9 @@ pub struct ModeEntry {
 }
 
 pub struct Engine {
+    strategy: EngineStrategy,
+    code_mode_handler: Option<Arc<dyn CodeModeHandler>>,
+    max_code_mode_tool_calls: Option<usize>,
     sampler: Sampler,
     /// The registry the engine was built with — the default for any mode id
     /// without an entry (and the empty-id "build" mode).
@@ -298,6 +305,9 @@ impl Engine {
         temperature: f32,
     ) -> Self {
         Self {
+            strategy: EngineStrategy::ReAct,
+            code_mode_handler: None,
+            max_code_mode_tool_calls: None,
             sampler: Sampler::new(provider),
             registry_full: registry,
             modes: Vec::new(),
@@ -350,6 +360,24 @@ impl Engine {
     /// unattended, sets its own bound here.
     pub fn set_max_tool_rounds(&mut self, rounds: usize) {
         self.max_tool_rounds = rounds;
+    }
+
+    pub fn set_strategy(&mut self, strategy: EngineStrategy) {
+        self.strategy = strategy;
+    }
+
+    /// Limit actual inner gateway attempts per Code Mode turn. None leaves
+    /// the parent call allowance unbounded; host program limits still apply.
+    pub fn set_max_code_mode_tool_calls(&mut self, calls: Option<usize>) {
+        self.max_code_mode_tool_calls = calls;
+    }
+
+    pub fn strategy(&self) -> EngineStrategy {
+        self.strategy
+    }
+
+    pub fn set_code_mode_handler(&mut self, handler: Arc<dyn CodeModeHandler>) {
+        self.code_mode_handler = Some(handler);
     }
 
     /// Set reasoning intensity. Explicit model maps constrain every caller;
@@ -447,6 +475,9 @@ impl Engine {
     /// name as a write, which is the behaviour we want for MCP calls in every
     /// other mode.
     fn request_tools_schema(&self) -> serde_json::Value {
+        if self.strategy == EngineStrategy::CodeMode {
+            return serde_json::json!([crate::code_mode::control_schema()]);
+        }
         let builtin = self.active_registry().request_schema();
         if !self.plugins_allowed() {
             return builtin;
@@ -790,6 +821,9 @@ impl Engine {
         // Optional bound — unlimited unless a caller asked for one. Round-trip
         // count is a poor proxy for a runaway; see `set_max_tool_rounds`.
         let max_tool_rounds = self.max_tool_rounds;
+        if self.strategy == EngineStrategy::CodeMode && max_tool_rounds == 0 {
+            force_no_tools = true;
+        }
         // A fresh turn starts from a clean policy state — a leftover
         // `goal_complete`/`submit_plan` from an earlier turn must not
         // short-circuit this one (the contracts are per-turn: each goal
@@ -1272,7 +1306,20 @@ impl Engine {
                 } else {
                     Some(round_text.clone())
                 },
-                tool_calls: Some(calls.clone()),
+                tool_calls: Some(
+                    calls
+                        .iter()
+                        .cloned()
+                        .map(|mut call| {
+                            if self.strategy == EngineStrategy::CodeMode
+                                && crate::schema::parse_arguments(&call.arguments).is_err()
+                            {
+                                call.arguments = "{}".into();
+                            }
+                            call
+                        })
+                        .collect(),
+                ),
                 tool_call_id: None,
                 is_error: None,
                 notice: None,
@@ -1289,18 +1336,86 @@ impl Engine {
             // at a time, so without this the stream stands still until each
             // call's turn comes.
             for call in calls.iter() {
-                let args: serde_json::Value = serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| serde_json::json!({ "_malformed": call.arguments }));
+                let args: serde_json::Value = if self.strategy == EngineStrategy::CodeMode {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::from_str(&call.arguments)
+                        .unwrap_or_else(|_| serde_json::json!({ "_malformed": call.arguments }))
+                };
                 let _ = io.ui_tx.send(UiEvent::ToolCallQueued {
                     name: call.name.clone(),
-                    args_preview: args_preview_of(&args),
+                    args_preview: if self.strategy == EngineStrategy::CodeMode {
+                        String::new()
+                    } else {
+                        args_preview_of(&args)
+                    },
                     call_id: call.id.clone(),
                     parent: None,
                     child_id: None,
                 });
             }
 
+            let mixed_code_mode_round = self.strategy == EngineStrategy::CodeMode
+                && calls.iter().any(|call| call.name != CONTROL_TOOL_NAME);
+            let mut code_mode_stop = None;
             for (call_idx, call) in calls.iter().enumerate() {
+                if self.strategy == EngineStrategy::CodeMode {
+                    Self::emit_state(
+                        io,
+                        AgentState::ExecutingTool {
+                            tool_name: call.name.clone(),
+                        },
+                    );
+                    let remaining = self
+                        .max_code_mode_tool_calls
+                        .map_or(usize::MAX, |limit| limit.saturating_sub(tool_calls_run));
+                    let rejection = if mixed_code_mode_round {
+                        Some("Code Mode accepts only execute_code control calls".to_string())
+                    } else if let Some(reason) = &code_mode_stop {
+                        Some(format!(
+                            "program skipped after prior control stop: {reason:?}"
+                        ))
+                    } else if io.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        Some("cancelled before dispatch".to_string())
+                    } else if force_no_tools || remaining == 0 {
+                        Some("parent tool budget exhausted".to_string())
+                    } else {
+                        None
+                    };
+                    let outcome = self
+                        .execute_code_mode_control(io, &invocation_turn, call, remaining, rejection)
+                        .await;
+                    if outcome.attempted_calls > remaining {
+                        code_mode_stop = Some("host exceeded the parent tool budget".to_string());
+                        force_no_tools = true;
+                    }
+                    tool_calls_run = tool_calls_run.saturating_add(outcome.attempted_calls);
+                    let stop = outcome.stop_reason.clone();
+                    history.push(if outcome.is_error {
+                        ChatMessage::tool_result_err(call.id.clone(), outcome.model_result)
+                    } else {
+                        ChatMessage::tool_result(call.id.clone(), outcome.model_result)
+                    });
+                    if matches!(stop, Some(invocation::InvocationStopReason::Cancelled))
+                        || io.cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        return self
+                            .abort_cancelled(io, history, &calls, call_idx + 1, "cancelled")
+                            .await;
+                    }
+                    if matches!(
+                        stop,
+                        Some(
+                            invocation::InvocationStopReason::UserRejected { .. }
+                                | invocation::InvocationStopReason::InvocationDeadline
+                        )
+                    ) {
+                        code_mode_stop = stop.map(|reason| format!("{reason:?}"));
+                    }
+                    self.drain_notices(io, history);
+                    self.drain_steering(io, history);
+                    continue;
+                }
                 let outcome = self
                     .invocation_gateway(io, &invocation_turn, None)
                     .invoke_queued(invocation::InvocationRequest::new(call.clone()))
@@ -1335,8 +1450,21 @@ impl Engine {
             }
 
             // If we have reached or exceeded the tool limit, force the next round to be a synthesis round without tools
-            if tool_rounds >= max_tool_rounds && !force_no_tools {
-                let msg = format!("已达单轮工具调用上限 ({max_tool_rounds} 轮)，正在汇总已收集的信息生成最终回答...");
+            if (tool_rounds >= max_tool_rounds
+                || (self.strategy == EngineStrategy::CodeMode
+                    && self
+                        .max_code_mode_tool_calls
+                        .is_some_and(|limit| tool_calls_run >= limit)))
+                && !force_no_tools
+            {
+                let msg = if tool_rounds >= max_tool_rounds {
+                    format!("已达单轮工具调用上限 ({max_tool_rounds} 轮)，正在汇总已收集的信息生成最终回答...")
+                } else {
+                    format!(
+                        "已达 Code Mode 工具调用上限 ({} 次)，正在汇总已收集的信息生成最终回答...",
+                        self.max_code_mode_tool_calls.unwrap_or(usize::MAX)
+                    )
+                };
                 let _ = io.ui_tx.send(UiEvent::SystemMessage(msg.clone()));
                 history.push(ChatMessage::notice(msg));
                 history.push(ChatMessage::user_hidden(
@@ -1347,6 +1475,89 @@ impl Engine {
 
             self.set_state(io, AgentState::Reasoning).await;
         }
+    }
+
+    async fn execute_code_mode_control(
+        &self,
+        io: &EngineIo,
+        turn: &invocation::InvocationTurn,
+        call: &agent_llm_core::types::ToolCall,
+        remaining_tool_calls: usize,
+        rejection: Option<String>,
+    ) -> CodeModeOutcome {
+        let _ = io.ui_tx.send(UiEvent::ToolCallStarted {
+            name: call.name.clone(),
+            args_preview: String::new(),
+            call_id: call.id.clone(),
+            parent: None,
+            child_id: None,
+        });
+        let mut terminal = invocation::TerminalGuard {
+            ui: io.ui_tx.clone(),
+            call: call.clone(),
+            parent: None,
+            finished: false,
+        };
+        let parent_scope = self.ctx.ext.get::<crate::invocation_scope::ScopeBinding>();
+        let mut outcome = if let Some(reason) = rejection {
+            CodeModeOutcome::rejected(reason)
+        } else {
+            match CodeModeRequest::parse(&call.arguments) {
+                Err(error) => CodeModeOutcome::rejected(error),
+                Ok(request) => match &self.code_mode_handler {
+                    None => CodeModeOutcome::rejected("Code Mode host handler is unavailable"),
+                    Some(handler) => {
+                        handler
+                            .execute(
+                                request,
+                                CodeModeContext {
+                                    engine: self,
+                                    io,
+                                    turn,
+                                    control_call: call,
+                                    tool_ctx: &self.ctx,
+                                    parent_identity: parent_scope
+                                        .as_ref()
+                                        .map(|scope| &scope.identity),
+                                    parent_deadline: parent_scope
+                                        .as_ref()
+                                        .and_then(|scope| scope.deadline),
+                                    request_id: next_request_id(),
+                                    remaining_tool_calls,
+                                },
+                            )
+                            .await
+                    }
+                },
+            }
+        };
+        if outcome.attempted_calls > remaining_tool_calls {
+            outcome.is_error = true;
+            outcome.model_result =
+                "host exceeded the parent tool budget; effects may have occurred".into();
+        }
+        if matches!(
+            outcome.stop_reason,
+            Some(
+                invocation::InvocationStopReason::UserRejected { .. }
+                    | invocation::InvocationStopReason::Cancelled
+                    | invocation::InvocationStopReason::InvocationDeadline
+            )
+        ) {
+            outcome.is_error = true;
+        }
+        outcome.bound_projection();
+        let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            ok: !outcome.is_error,
+            content: outcome.model_result.clone(),
+            ui_type: None,
+            parent: None,
+            child_id: None,
+        });
+        terminal.finished = true;
+        outcome
     }
 
     /// Abandon the turn because the user cancelled.
@@ -1365,6 +1576,15 @@ impl Engine {
         label: &str,
     ) -> Result<TurnOutcome, String> {
         for pending_call in calls.iter().skip(from) {
+            if self.strategy == EngineStrategy::CodeMode {
+                let _ = io.ui_tx.send(UiEvent::ToolCallStarted {
+                    name: pending_call.name.clone(),
+                    args_preview: String::new(),
+                    call_id: pending_call.id.clone(),
+                    parent: None,
+                    child_id: None,
+                });
+            }
             let _ = io.ui_tx.send(UiEvent::ToolCallFinished {
                 call_id: pending_call.id.clone(),
                 name: pending_call.name.clone(),
@@ -1758,8 +1978,12 @@ impl Engine {
         }
     }
 
+    fn emit_state(io: &EngineIo, state: AgentState) {
+        let _ = io.ui_tx.send(UiEvent::StateChanged(state));
+    }
+
     async fn set_state(&self, io: &EngineIo, state: AgentState) {
-        let _ = io.ui_tx.send(UiEvent::StateChanged(state.clone()));
+        Self::emit_state(io, state.clone());
         if let Some(binding) = self.ctx.ext.get::<crate::invocation_scope::ScopeBinding>() {
             tokio::select! {
                 biased;

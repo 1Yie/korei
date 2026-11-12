@@ -4,6 +4,67 @@ The agent loop dispatches tools and manages context, hooks and subagents.
 Providers, tools and host policy enter through the contracts exported by
 [`src/lib.rs`](src/lib.rs).
 
+## Execution strategies
+
+`Engine` defaults to `EngineStrategy::ReAct`. A host selects
+`EngineStrategy::CodeMode` with `set_strategy` and installs one
+`Arc<dyn CodeModeHandler>` with `set_code_mode_handler`. The public contract
+lives in [`code_mode`](src/code_mode.rs). Both strategies use the same turn
+loop and neutral provider tool-call/result protocol. Code Mode exposes only
+the `execute_code` schema; the registry is used for actual capabilities, never
+to resolve the control handler. A response mixing control and direct capability
+calls is rejected as a whole. Missing handlers and invalid requests fail closed.
+
+The handler borrows `CodeModeContext` for this execution: `Engine`, `EngineIo`,
+the current `InvocationTurn`, original control call, trusted outer request ID,
+tool context, optional parent identity/deadline and remaining call allowance.
+It creates scoped gateways through `context.engine.invocation_gateway` using
+`context.io` and `context.turn`. Code, JSON params and optional requested limits
+are untrusted inputs validated against the existing bounded JSON/schema
+boundary. The host clamps requested limits and binds code/params to its VM.
+Identity and scope authority come from trusted host state.
+
+`max_tool_rounds` counts assistant tool rounds in either strategy. The separate
+`set_max_code_mode_tool_calls(Some(limit))` bounds actual inner gateway attempts
+across all programs and rounds of a Code Mode turn; its default is `None`.
+`remaining_tool_calls == usize::MAX` represents no configured parent call cap.
+Every host program still requires finite runtime and dispatch limits. The host
+must reserve from the remaining allowance before each dispatch, atomically for
+concurrent calls, and return actual `attempted_calls`. Program/scope creation
+cannot reset parent or policy budgets. The kernel accounts returned attempts
+and forces a final tool-free sample when a configured cap is exhausted. A host
+report exceeding the allowance is a contract error: subsequent programs stop,
+and the error explicitly preserves uncertainty about effects already incurred.
+
+`CodeModeOutcome` contains only an explicit model projection, error flag,
+actual attempt count and optional trusted `InvocationStopReason`. The kernel
+bounds projection text to `MAX_MODEL_RESULT_BYTES` with an explicit truncation
+marker and correlates one outer tool result to the original call. Raw inner
+outputs are never automatically appended to history. Partial failures belong
+in the projection and its error flag. `UserRejected { request_id }` must come
+from gateway audit provenance. Human refusal and execution deadline stop the
+remaining prewritten controls in that assistant response and return to the
+model. Cancellation stops the turn. Ordinary policy errors and guest error
+strings carry no human-refusal authority.
+
+The kernel owns outer queued/started/finished correlation, including rejection
+and unavailable-handler paths. The outer control's execution state is UI-only:
+it invokes neither root state hooks nor root tool hooks. Actual inner calls
+run hooks through the host's scoped invocation gateway. Input, reasoning and
+response lifecycle hooks retain their normal behavior. A host session mirror
+must suppress hook dispatch for outer control UI events or rebind it to the
+execution scope after durable execution begin; kernel UI delivery alone does
+not enforce that host boundary. Typed `agent_ipc::code_mode` payloads use bounded
+`UiEvent::Custom` envelopes named `code_mode.started`, `code_mode.progress` and
+`code_mode.finished`. The host supplies execution/session/agent identity and
+optional inner request correlation. Emit start before progress. The host owns
+the execution ledger, admission stop, cancellation, gateway completion drain,
+artifact finalization and terminal audit; only after these complete may it emit
+its unique execution finished event and return. The kernel awaits handler
+cleanup cooperatively and emits outer finished after return. Console/summary
+carry bounded diagnostics and opaque artifact references, never full raw tool
+outputs. The kernel implements this contract and channel, not a VM or sandbox.
+
 ## Invocation gateway
 
 [`invocation`](src/invocation.rs) exposes a turn-borrowed gateway for discovery,

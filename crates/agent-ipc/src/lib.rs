@@ -6,6 +6,7 @@
 //! feedback — stays in `agent-kernel/src/channels.rs`; it never crosses a
 //! transport.
 
+pub mod code_mode;
 /// Wire codec (length-prefixed JSON frames) — no in-tree consumer yet: the
 /// Tauri bridge passes typed values in-process. Kept as the framing contract
 /// for out-of-process/stdio frontends.

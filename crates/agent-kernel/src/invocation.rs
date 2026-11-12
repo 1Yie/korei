@@ -23,11 +23,11 @@ pub const AUDIT_IO_BUDGET: Duration = Duration::from_secs(5);
 const MAX_AUDIT_RESULT_BYTES: usize = 16 * 1024;
 const MAX_METADATA_BYTES: usize = 1024;
 
-struct TerminalGuard {
-    ui: crate::channels::UiSink,
-    call: ToolCall,
-    parent: Option<String>,
-    finished: bool,
+pub(super) struct TerminalGuard {
+    pub(super) ui: crate::channels::UiSink,
+    pub(super) call: ToolCall,
+    pub(super) parent: Option<String>,
+    pub(super) finished: bool,
 }
 
 impl Drop for TerminalGuard {

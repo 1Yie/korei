@@ -9,6 +9,7 @@
 //! ReAct loop runs headless on a scripted provider (`cargo test -p agent-kernel`).
 
 pub mod channels;
+pub mod code_mode;
 pub mod compaction;
 pub mod engine;
 pub mod hooks;
