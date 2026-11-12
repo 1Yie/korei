@@ -96,6 +96,737 @@ fn request(id: &str, name: &str, args: &str) -> InvocationRequest {
     })
 }
 
+use agent_kernel::invocation_scope::{InvocationIdentity, InvocationScope, ScopedChildServices};
+
+#[derive(Clone)]
+struct ScopeProbe {
+    value: usize,
+    phases: Arc<Mutex<Vec<String>>>,
+}
+
+fn scope_probe(ctx: &ToolCtx, phase: &str) -> usize {
+    let probe = ctx.require::<ScopeProbe>("scope probe").unwrap();
+    probe
+        .phases
+        .lock()
+        .unwrap()
+        .push(format!("{phase}:{}", probe.value));
+    probe.value
+}
+
+fn test_scope(
+    ctx: ToolCtx,
+    hooks: HookChain,
+    plugins: Option<PluginHandle>,
+    sink: Option<Arc<dyn AuditSink>>,
+    deadline: Option<std::time::Instant>,
+) -> InvocationScope {
+    InvocationScope::new(
+        Arc::new(ctx),
+        InvocationIdentity {
+            execution_id: "trusted-execution".into(),
+            agent_id: "trusted-agent".into(),
+            session_id: "trusted-session".into(),
+            trace_id: Some("trusted-trace".into()),
+            parent_call_id: Some("trusted-parent".into()),
+        },
+        hooks,
+        plugins,
+        sink,
+        deadline,
+    )
+}
+
+struct ScopeHooks;
+
+#[async_trait]
+impl AgentHook for ScopeHooks {
+    fn id(&self) -> &str {
+        "scope"
+    }
+    async fn before_tool_execute(&self, ctx: &ToolCtx, call: &mut ToolCall) -> anyhow::Result<()> {
+        let value = scope_probe(ctx, "before");
+        if call.name == "stage" {
+            call.arguments = json!({"value":value}).to_string();
+        }
+        Ok(())
+    }
+    async fn after_tool_execute(
+        &self,
+        ctx: &ToolCtx,
+        _: &ToolCall,
+        _: &mut String,
+    ) -> anyhow::Result<()> {
+        scope_probe(ctx, "after");
+        Ok(())
+    }
+    async fn on_state_transition(
+        &self,
+        ctx: &ToolCtx,
+        _: &agent_ipc::AgentState,
+        _: &agent_ipc::AgentState,
+    ) {
+        scope_probe(ctx, "state");
+    }
+}
+
+struct ScopeBudget {
+    starts: Arc<AtomicUsize>,
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl TurnPolicy for ScopeBudget {
+    fn begin_turn(&self) {
+        self.starts.fetch_add(1, Ordering::SeqCst);
+    }
+    async fn before_dispatch(&self, ctx: &ToolCtx, _: &str, _: bool) -> Option<String> {
+        scope_probe(ctx, "policy");
+        (self.calls.fetch_add(1, Ordering::SeqCst) > 0).then(|| "parent budget exhausted".into())
+    }
+    async fn after_execute(&self, ctx: &ToolCtx, _: &ToolCall, _: &ToolResult) {
+        scope_probe(ctx, "policy-after");
+    }
+    async fn on_quiet_round(&self, _: &dyn TurnView) -> Verdict {
+        Verdict::finish()
+    }
+}
+
+#[tokio::test]
+async fn scoped_stages_use_one_binding_and_scopes_share_the_parent_budget() {
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let starts = Arc::new(AtomicUsize::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut stage = tool("stage", false, Arc::new(AtomicUsize::new(0)));
+    stage.staged = true;
+    stage.review = Some(Arc::new(|args, ctx| {
+        assert_eq!(args["value"], scope_probe(ctx, "review"));
+        let ctx = ctx.clone();
+        Review {
+            prepare: Some(
+                async move {
+                    scope_probe(&ctx, "prepare");
+                    Ok(())
+                }
+                .boxed(),
+            ),
+            ..Default::default()
+        }
+    }));
+    stage.exec = Arc::new(|args, ctx| {
+        async move {
+            assert_eq!(args["value"], scope_probe(&ctx, "dispatch"));
+            Ok(ToolResult {
+                commit: Some(Commit::new(async move {
+                    scope_probe(&ctx, "commit");
+                    Ok(())
+                })),
+                ..ToolResult::text("preview")
+            })
+        }
+        .boxed()
+    });
+    let (mut engine, io, _) = harness(vec![stage]);
+    let root_hooks = HookChain::new();
+    root_hooks.replace(vec![Arc::new(ScopeHooks)]);
+    engine.set_hooks(root_hooks);
+    engine.set_policy(Box::new(ScopeBudget {
+        starts: starts.clone(),
+        calls: calls.clone(),
+    }));
+    let turn = engine.begin_invocation_turn();
+    let sink = Arc::new(EffectAudit::default());
+    for value in [7, 8] {
+        let mut ctx = ToolCtx::new();
+        ctx.ext.insert(Arc::new(ScopeProbe {
+            value,
+            phases: phases.clone(),
+        }));
+        let hooks = HookChain::new();
+        hooks.replace(vec![Arc::new(ScopeHooks)]);
+        let scope = test_scope(ctx, hooks, None, Some(sink.clone()), None);
+        let mut req = request(&format!("stage-{value}"), "stage", r#"{"value":1}"#);
+        req.metadata.execution_id = Some("forged".into());
+        req.metadata.agent_id = Some("forged".into());
+        req.metadata.parent_call_id = Some("forged".into());
+        let out = engine
+            .invocation_gateway(&io, &turn, None)
+            .with_scope(&scope)
+            .invoke(req)
+            .await;
+        assert_eq!(out.ok(), value == 7, "{}", out.content);
+        assert_eq!(
+            out.audit.metadata.execution_id.as_deref(),
+            Some("trusted-execution")
+        );
+        assert_eq!(
+            out.audit.metadata.agent_id.as_deref(),
+            Some("trusted-agent")
+        );
+        assert_eq!(
+            out.audit.metadata.parent_call_id.as_deref(),
+            Some("trusted-parent")
+        );
+        scope.close().await.unwrap();
+    }
+    assert_eq!(starts.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let phases = phases.lock().unwrap();
+    for phase in [
+        "before",
+        "review",
+        "prepare",
+        "dispatch",
+        "policy",
+        "state",
+        "commit",
+        "policy-after",
+        "after",
+    ] {
+        assert!(phases.contains(&format!("{phase}:7")), "{phases:?}");
+    }
+    assert!(!phases.contains(&"commit:8".into()));
+    let effects = sink.effects.lock().unwrap();
+    assert!(effects
+        .iter()
+        .any(|e| e.phase == InvocationPhase::Prepare && e.authorized_call.is_none()));
+    assert!(effects
+        .iter()
+        .any(|e| e.phase == InvocationPhase::Commit && e.authorized_call.is_some()));
+    assert_eq!(sink.finishes.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn scoped_discovery_and_plugin_dispatch_never_fall_back_to_root() {
+    let root_runs = Arc::new(AtomicUsize::new(0));
+    let scoped_runs = Arc::new(AtomicUsize::new(0));
+    let (mut engine, io, _) = harness(Vec::new());
+    let root: PluginHandle = Default::default();
+    *root.write().unwrap() = Some(Arc::new(Router {
+        name: "root",
+        runs: root_runs.clone(),
+    }));
+    engine.set_plugins(root);
+    let scoped: PluginHandle = Default::default();
+    *scoped.write().unwrap() = Some(Arc::new(Router {
+        name: "scoped",
+        runs: scoped_runs.clone(),
+    }));
+    let scope = test_scope(ToolCtx::new(), HookChain::new(), Some(scoped), None, None);
+    let turn = engine.begin_invocation_turn();
+    let gateway = engine
+        .invocation_gateway(&io, &turn, None)
+        .with_scope(&scope);
+    assert_eq!(gateway.list().unwrap()[0].name, "scoped");
+    assert!(gateway.describe("root").is_err());
+    assert!(!gateway
+        .invoke(request("root", "root", r#"{"value":1}"#))
+        .await
+        .ok());
+    assert!(gateway
+        .invoke(request("scoped", "scoped", r#"{"value":1}"#))
+        .await
+        .ok());
+    assert_eq!(root_runs.load(Ordering::SeqCst), 0);
+    assert_eq!(scoped_runs.load(Ordering::SeqCst), 1);
+    scope.close().await.unwrap();
+    assert!(gateway.list().is_err());
+    assert!(!gateway
+        .invoke(request("late", "scoped", r#"{"value":1}"#))
+        .await
+        .ok());
+    assert_eq!(scoped_runs.load(Ordering::SeqCst), 1);
+}
+
+struct ScopedStateWait {
+    entered: Arc<tokio::sync::Notify>,
+    dropped: Arc<AtomicUsize>,
+    effects: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl AgentHook for ScopedStateWait {
+    fn id(&self) -> &str {
+        "scoped-state-wait"
+    }
+    async fn on_state_transition(
+        &self,
+        _: &ToolCtx,
+        _: &agent_ipc::AgentState,
+        _: &agent_ipc::AgentState,
+    ) {
+        let _drop = AuditDrop(&self.dropped);
+        self.entered.notify_one();
+        futures::future::pending::<()>().await;
+        self.effects.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn scoped_state_hooks_are_cancelled_inline_and_close_waits_for_terminal_audit() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let effects = Arc::new(AtomicUsize::new(0));
+    let (engine, io, mut rx) = harness(vec![tool("probe", true, runs.clone())]);
+    let hooks = HookChain::new();
+    hooks.replace(vec![Arc::new(ScopedStateWait {
+        entered: entered.clone(),
+        dropped: dropped.clone(),
+        effects: effects.clone(),
+    })]);
+    let sink = Arc::new(EffectAudit {
+        pending: Some("finish"),
+        ..Default::default()
+    });
+    let scope = test_scope(
+        ToolCtx::new(),
+        hooks.clone(),
+        None,
+        Some(sink.clone()),
+        None,
+    );
+    hooks.observe_nowait(scope.ctx().clone(), &agent_ipc::AgentState::Reasoning);
+    let turn = InvocationTurn::default();
+    let gateway = engine
+        .invocation_gateway(&io, &turn, None)
+        .with_scope(&scope);
+    let stop = async {
+        entered.notified().await;
+        scope.close().await.unwrap();
+        assert_eq!(sink.dropped.load(Ordering::SeqCst), 1);
+    };
+    let (out, ()) = tokio::join!(
+        gateway.invoke(request("hook", "probe", r#"{"value":1}"#)),
+        stop
+    );
+    assert_eq!(out.status, InvocationStatus::Cancelled);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert_eq!(effects.load(Ordering::SeqCst), 0);
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert_eq!(terminals(&mut rx), 1);
+    assert!(!io.cancel.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn scoped_async_grants_recheck_authority_and_stop_before_late_effects() {
+    for case in ["success", "cancel", "deadline", "revoked", "rejected"] {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let grants = Arc::new(AtomicUsize::new(0));
+        let granted = Arc::new(AtomicBool::new(false));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::new(EffectAudit::default());
+        let mut probe = tool("read", true, attempts.clone());
+        let count = attempts.clone();
+        let access = granted.clone();
+        probe.exec = Arc::new(move |_, _| {
+            let count = count.clone();
+            let access = access.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                if access.load(Ordering::SeqCst) {
+                    Ok(ToolResult::text("granted"))
+                } else {
+                    Err(ToolError::OutOfScope {
+                        path: "/scoped/file".into(),
+                        suggestion: None,
+                    })
+                }
+            }
+            .boxed()
+        });
+        let (mut engine, io, mut rx) = harness(vec![probe]);
+        let mut ctx = ToolCtx::new();
+        let (entered_grant, release_grant, grant_drop, grant_count, audit) = (
+            entered.clone(),
+            release.clone(),
+            dropped.clone(),
+            grants.clone(),
+            sink.clone(),
+        );
+        ctx.install_scope_grant(Arc::new(move |_, path, _| {
+            let (entered, release, dropped, grants, granted, audit) = (
+                entered_grant.clone(),
+                release_grant.clone(),
+                grant_drop.clone(),
+                grant_count.clone(),
+                granted.clone(),
+                audit.clone(),
+            );
+            Box::pin(async move {
+                let _drop = AuditDrop(&dropped);
+                assert_eq!(path, "/scoped/file");
+                assert!(audit
+                    .effects
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e.phase, InvocationPhase::ScopeGrant { .. })));
+                entered.notify_one();
+                release.notified().await;
+                grants.fetch_add(1, Ordering::SeqCst);
+                granted.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        }));
+        let deadline =
+            (case == "deadline").then(|| std::time::Instant::now() + Duration::from_millis(100));
+        let scope = test_scope(ctx, HookChain::new(), None, Some(sink.clone()), deadline);
+        let permissions = engine.permissions_writer();
+        let turn = engine.begin_invocation_turn();
+        let gateway = engine
+            .invocation_gateway(&io, &turn, None)
+            .with_scope(&scope);
+        let decisions = engine.decision_slot();
+        let control = async {
+            let request_id = loop {
+                if let Some(UiEvent::ApprovalRequested { request_id, .. }) = rx.try_recv() {
+                    *decisions.lock().unwrap() = Some((
+                        request_id,
+                        ToolVerdict {
+                            approved: case != "rejected",
+                            action: Some("link:session".into()),
+                        },
+                    ));
+                    break request_id;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
+            if case == "rejected" {
+                return request_id;
+            }
+            entered.notified().await;
+            match case {
+                "cancel" => scope.cancel(),
+                "deadline" => {}
+                "revoked" => {
+                    *permissions.write().unwrap() = PermissionGate::new(
+                        PermissionMode::Bypass,
+                        PermissionRules {
+                            deny: ["read".to_string()].into_iter().collect(),
+                            ..Default::default()
+                        },
+                    );
+                    release.notify_one();
+                }
+                _ => release.notify_one(),
+            }
+            request_id
+        };
+        let (out, approval_id) = tokio::join!(
+            gateway.invoke(request(case, "read", r#"{"value":1}"#)),
+            control
+        );
+        assert_eq!(out.ok(), case == "success", "{case}: {}", out.content);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            if case == "success" { 2 } else { 1 },
+            "{case}"
+        );
+        assert_eq!(
+            grants.load(Ordering::SeqCst),
+            usize::from(matches!(case, "success" | "revoked")),
+            "{case}"
+        );
+        assert_eq!(
+            dropped.load(Ordering::SeqCst),
+            usize::from(case != "rejected"),
+            "{case}"
+        );
+        match case {
+            "rejected" => assert_eq!(
+                out.audit.stop_reason,
+                Some(InvocationStopReason::UserRejected {
+                    request_id: approval_id
+                })
+            ),
+            "cancel" => assert_eq!(out.audit.stop_reason, Some(InvocationStopReason::Cancelled)),
+            "deadline" => assert_eq!(
+                out.audit.stop_reason,
+                Some(InvocationStopReason::InvocationDeadline)
+            ),
+            _ => {}
+        }
+        scope.close().await.unwrap();
+        assert_eq!(sink.finishes.lock().unwrap().len(), 1);
+        assert!(!io.cancel.load(Ordering::SeqCst));
+    }
+}
+
+#[tokio::test]
+async fn scoped_nested_calls_share_context_audit_and_reject_late_dispatch() {
+    use agent_kernel::tools::dispatch::NestedDispatcher;
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::new(Mutex::new(None::<NestedDispatcher>));
+    let mut probe = tool("probe", true, Arc::new(AtomicUsize::new(0)));
+    let saved = captured.clone();
+    probe.exec = Arc::new(move |_, ctx| {
+        let saved = saved.clone();
+        async move {
+            assert_eq!(scope_probe(&ctx, "nested"), 42);
+            *saved.lock().unwrap() = Some((*ctx.ext.get::<NestedDispatcher>().unwrap()).clone());
+            Ok(ToolResult::text("scoped nested"))
+        }
+        .boxed()
+    });
+    let (engine, io, _) = harness(vec![agent_kernel::tools::batch::spec(), probe]);
+    let mut ctx = ToolCtx::new();
+    ctx.ext.insert(Arc::new(ScopeProbe {
+        value: 42,
+        phases: phases.clone(),
+    }));
+    let hooks = HookChain::new();
+    hooks.replace(vec![Arc::new(ScopeHooks)]);
+    let sink = Arc::new(EffectAudit::default());
+    let scope = test_scope(ctx, hooks, None, Some(sink.clone()), None);
+    let turn = InvocationTurn::default();
+    let out = engine
+        .invocation_gateway(&io, &turn, None)
+        .with_scope(&scope)
+        .invoke(batch_request(json!([{"tool":"probe","args":{"value":1}}])))
+        .await;
+    assert!(out.ok(), "{}", out.content);
+    assert!(out.content.contains("scoped nested"), "{}", out.content);
+    let audits = sink.finishes.lock().unwrap().clone();
+    assert_eq!(audits.len(), 2);
+    let nested = audits
+        .iter()
+        .find(|a| a.metadata.invocation_id != out.audit.metadata.invocation_id)
+        .unwrap();
+    assert_eq!(
+        nested.metadata.execution_id,
+        out.audit.metadata.execution_id
+    );
+    assert_eq!(
+        nested.metadata.parent_call_id.as_deref(),
+        Some(out.audit.metadata.invocation_id.as_str())
+    );
+    scope.close().await.unwrap();
+    let late = captured
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .invoke(
+            ToolCall {
+                id: "late".into(),
+                name: "probe".into(),
+                arguments: r#"{"value":1}"#.into(),
+            },
+            Arc::new(AtomicBool::new(false)),
+            std::time::Instant::now() + Duration::from_secs(1),
+            None,
+        )
+        .await;
+    assert!(late.is_err());
+    assert_eq!(
+        phases
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.as_str() == "nested:42")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn scoped_background_children_require_bound_services_keep_own_authority_and_drain() {
+    use agent_kernel::tools::delegate::{self, ChildRoute, SubagentSpawner};
+    use agent_llm_core::types::StreamChunk;
+    for factory in [false, true] {
+        let phases = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let critical_runs = Arc::new(AtomicUsize::new(0));
+        let child_provider = Arc::new(ScriptedProvider::new());
+        for (id, name) in [("child-critical", "critical"), ("child-read", "read")] {
+            child_provider.push_script(vec![
+                StreamChunk::ToolCallDelta {
+                    slot: 0,
+                    id: Some(id.into()),
+                    name: Some(name.into()),
+                    args_delta: r#"{"value":1}"#.into(),
+                },
+                StreamChunk::Done {
+                    prompt_tokens: None,
+                    completion_tokens: None,
+                    cached_tokens: None,
+                },
+            ]);
+        }
+        let mut critical = tool("critical", true, critical_runs.clone());
+        critical.review = Some(Arc::new(|_, ctx| {
+            assert_eq!(scope_probe(ctx, "child-review"), 43);
+            Review {
+                risk: CallRisk::Critical,
+                ..Default::default()
+            }
+        }));
+        let mut read = tool("read", true, Arc::new(AtomicUsize::new(0)));
+        let (read_entered, read_dropped) = (entered.clone(), dropped.clone());
+        read.exec = Arc::new(move |_, ctx| {
+            let (entered, dropped) = (read_entered.clone(), read_dropped.clone());
+            async move {
+                let _drop = AuditDrop(&dropped);
+                assert_eq!(scope_probe(&ctx, "child-dispatch"), 43);
+                entered.notify_one();
+                futures::future::pending::<()>().await;
+                Ok(ToolResult::text("unreachable"))
+            }
+            .boxed()
+        });
+        let mut child_registry = ToolRegistry::new();
+        child_registry.register(critical);
+        child_registry.register(read);
+        let child_registry = Arc::new(child_registry);
+        let gate = Arc::new(std::sync::RwLock::new(PermissionGate::from_mode_str(
+            "bypass",
+        )));
+        let mut spawner = SubagentSpawner::new(
+            Arc::new(std::sync::RwLock::new(ChildRoute {
+                provider: child_provider,
+                model: "scripted".into(),
+                temperature: 0.0,
+                context_window: 100_000,
+                thinking_level: None,
+                thinking_level_map: None,
+                model_params: Default::default(),
+                model_input: vec![],
+                models: Default::default(),
+            })),
+            child_registry.clone(),
+            child_registry,
+        )
+        .with_parent_gate(gate.clone());
+        if factory {
+            spawner = spawner
+                .with_scoped_services(Arc::new(|parent, child| {
+                    let marker = parent.require::<ScopeProbe>("parent probe").unwrap();
+                    assert_eq!(scope_probe(parent, "child-factory"), 42);
+                    child.ext.insert(Arc::new(ScopeProbe {
+                        value: 43,
+                        phases: marker.phases.clone(),
+                    }));
+                    let hooks = HookChain::new();
+                    hooks.replace(vec![Arc::new(ScopeHooks)]);
+                    Ok(ScopedChildServices {
+                        hooks,
+                        plugins: None,
+                    })
+                }))
+                .with_policy(Arc::new(|parent, child| {
+                    assert_eq!(scope_probe(parent, "child-policy-parent"), 42);
+                    assert_eq!(scope_probe(child, "child-policy-context"), 43);
+                    Box::new(agent_kernel::turn_policy::NoopPolicy)
+                }));
+        }
+        let session = if factory { -5011 } else { -5010 };
+        let mut ctx = ToolCtx::new().with_session(session);
+        ctx.ext.insert(Arc::new(ScopeProbe {
+            value: 42,
+            phases: phases.clone(),
+        }));
+        ctx.install_subagent(spawner);
+        let global_cancel = Arc::new(AtomicBool::new(false));
+        delegate::install_background_cancel(&mut ctx, global_cancel.clone());
+        let (mut engine, io, _) = harness(vec![delegate::spec(), delegate::answer_child_spec()]);
+        engine.set_permissions_shared(gate);
+        let hooks = HookChain::new();
+        hooks.replace(vec![Arc::new(ScopeHooks)]);
+        let sink = Arc::new(EffectAudit::default());
+        let scope = test_scope(ctx, hooks, None, Some(sink.clone()), None);
+        let turn = engine.begin_invocation_turn();
+        let gateway = engine
+            .invocation_gateway(&io, &turn, None)
+            .with_scope(&scope);
+        let out = gateway
+            .invoke(request(
+                "delegate-call",
+                "delegate",
+                r#"{"task":"inspect","background":true}"#,
+            ))
+            .await;
+        if !factory {
+            assert!(!out.ok());
+            assert!(
+                out.content.contains("scoped child services factory"),
+                "{}",
+                out.content
+            );
+            scope.close().await.unwrap();
+            assert!(delegate::active_children(session).is_empty());
+            continue;
+        }
+        assert!(out.ok(), "{}", out.content);
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        let child_id = delegate::active_children(session)[0];
+        assert_eq!(critical_runs.load(Ordering::SeqCst), 0);
+        let mut other_ctx = ToolCtx::new().with_session(session);
+        other_ctx.install_subagent(scope.ctx().subagent().unwrap().0.clone());
+        let other = test_scope(other_ctx, HookChain::new(), None, None, None);
+        let foreign = engine
+            .invocation_gateway(&io, &turn, None)
+            .with_scope(&other)
+            .invoke(request(
+                "foreign",
+                "answer_child",
+                &json!({"child_id":child_id,"answer":"continue"}).to_string(),
+            ))
+            .await;
+        assert!(!foreign.ok());
+        assert!(
+            foreign.content.contains("in this invocation scope"),
+            "{}",
+            foreign.content
+        );
+        other.close().await.unwrap();
+        scope.close().await.unwrap();
+        assert!(delegate::active_children(session).is_empty());
+        assert!(delegate::active_child_infos(session).is_empty());
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(!global_cancel.load(Ordering::SeqCst));
+        assert!(!io.cancel.load(Ordering::SeqCst));
+        let late = gateway
+            .invoke(request(
+                "late-child",
+                "delegate",
+                r#"{"task":"late","background":true}"#,
+            ))
+            .await;
+        assert!(!late.ok());
+        let finishes = sink.finishes.lock().unwrap();
+        let child_audits: Vec<_> = finishes
+            .iter()
+            .filter(|a| a.metadata.parent_call_id.as_deref() == Some("delegate-call"))
+            .collect();
+        assert_eq!(child_audits.len(), 2, "{finishes:?}");
+        for audit in child_audits {
+            assert_eq!(
+                audit.metadata.execution_id.as_deref(),
+                Some("trusted-execution")
+            );
+            assert_eq!(
+                audit.metadata.agent_id.as_deref(),
+                Some(child_id.to_string().as_str())
+            );
+        }
+        assert!(finishes
+            .iter()
+            .any(|a| a.metadata.invocation_id == "child-critical"
+                && a.status == InvocationStatus::Denied));
+        assert!(finishes
+            .iter()
+            .any(|a| a.metadata.invocation_id == "child-read"
+                && a.status == InvocationStatus::Cancelled));
+        assert!(phases.lock().unwrap().contains(&"state:43".to_string()));
+    }
+}
+
 fn terminals(rx: &mut UiReceiver) -> usize {
     let mut count = 0;
     while let Some(event) = rx.try_recv() {
@@ -184,7 +915,7 @@ impl AgentHook for Rewrite {
     fn id(&self) -> &str {
         "rewrite"
     }
-    async fn before_tool_execute(&self, call: &mut ToolCall) -> anyhow::Result<()> {
+    async fn before_tool_execute(&self, _ctx: &ToolCtx, call: &mut ToolCall) -> anyhow::Result<()> {
         call.arguments = self.0.into();
         call.id = "forged".into();
         Ok(())
@@ -418,7 +1149,7 @@ struct Baseline {
 #[async_trait]
 impl TurnPolicy for Baseline {
     fn begin_turn(&self) {}
-    async fn before_dispatch(&self, _: &str, _: bool) -> Option<String> {
+    async fn before_dispatch(&self, _: &ToolCtx, _: &str, _: bool) -> Option<String> {
         if !self.started.swap(true, Ordering::SeqCst) {
             tokio::time::sleep(Duration::from_millis(20)).await;
             self.ready.store(true, Ordering::SeqCst);
@@ -659,7 +1390,7 @@ async fn scope_grant_retries_the_same_builtin_once() {
         assert_eq!(path, "/outside/file");
         assert_eq!(access, "read");
         scope.store(true, Ordering::SeqCst);
-        Ok(())
+        Box::pin(async { Ok(()) })
     }));
     let mut probe = tool("read", true, attempts.clone());
     let count = attempts.clone();
@@ -803,7 +1534,7 @@ async fn scope_permission_tightening_requires_separate_tool_approval() {
     let scope = granted.clone();
     ctx.install_scope_grant(Arc::new(move |_, _, _| {
         scope.store(true, Ordering::SeqCst);
-        Ok(())
+        Box::pin(async { Ok(()) })
     }));
     let mut probe = tool("probe", true, runs.clone());
     let calls = runs.clone();
@@ -907,7 +1638,7 @@ struct PausedPolicy {
 #[async_trait]
 impl TurnPolicy for PausedPolicy {
     fn begin_turn(&self) {}
-    async fn before_dispatch(&self, _: &str, _: bool) -> Option<String> {
+    async fn before_dispatch(&self, _: &ToolCtx, _: &str, _: bool) -> Option<String> {
         self.entered.notify_one();
         self.release.notified().await;
         None
@@ -970,7 +1701,7 @@ impl AgentHook for NestedHook {
     fn id(&self) -> &str {
         "nested"
     }
-    async fn before_tool_execute(&self, call: &mut ToolCall) -> anyhow::Result<()> {
+    async fn before_tool_execute(&self, _: &ToolCtx, call: &mut ToolCall) -> anyhow::Result<()> {
         if call.name == "probe" {
             call.arguments = json!({"value":self.value}).to_string();
             if self.rename {
@@ -988,7 +1719,7 @@ struct NestedPolicy {
 #[async_trait]
 impl TurnPolicy for NestedPolicy {
     fn begin_turn(&self) {}
-    async fn before_dispatch(&self, tool: &str, _: bool) -> Option<String> {
+    async fn before_dispatch(&self, _ctx: &ToolCtx, tool: &str, _: bool) -> Option<String> {
         if tool == "probe" {
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.deny {
@@ -1196,7 +1927,7 @@ async fn scope_grant_audit_permission_and_stop_boundaries_are_enforced() {
         let granted = grants.clone();
         ctx.install_scope_grant(Arc::new(move |_, _, _| {
             granted.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Box::pin(async { Ok(()) })
         }));
         let mut probe = tool("read", true, runs.clone());
         let granted = grants.clone();
@@ -1344,14 +2075,19 @@ impl AgentHook for PendingInvocationHook {
     fn id(&self) -> &str {
         "pending-boundary"
     }
-    async fn before_tool_execute(&self, _: &mut ToolCall) -> anyhow::Result<()> {
+    async fn before_tool_execute(&self, _: &ToolCtx, _: &mut ToolCall) -> anyhow::Result<()> {
         if !self.after {
             self.entered.notify_one();
             futures::future::pending::<()>().await;
         }
         Ok(())
     }
-    async fn after_tool_execute(&self, _: &ToolCall, _: &mut String) -> anyhow::Result<()> {
+    async fn after_tool_execute(
+        &self,
+        _: &ToolCtx,
+        _: &ToolCall,
+        _: &mut String,
+    ) -> anyhow::Result<()> {
         if self.after {
             self.entered.notify_one();
             futures::future::pending::<()>().await;

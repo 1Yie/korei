@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::tools::registry::ToolCtx;
 use agent_ipc::AgentState;
 use agent_llm_core::types::{ChatMessage, ToolCall};
 use async_trait::async_trait;
@@ -43,13 +44,18 @@ pub trait AgentHook: Send + Sync {
 
     /// Before a tool executes — `Err(reason)` vetoes, `Ok(())` proceeds to the
     /// permission gate (a hook can't approve).
-    async fn before_tool_execute(&self, _call: &mut ToolCall) -> anyhow::Result<()> {
+    async fn before_tool_execute(
+        &self,
+        _ctx: &ToolCtx,
+        _call: &mut ToolCall,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
     /// After a tool executes — may mutate `output` (truncation applies).
     async fn after_tool_execute(
         &self,
+        _ctx: &ToolCtx,
         _call: &ToolCall,
         _output: &mut String,
     ) -> anyhow::Result<()> {
@@ -57,7 +63,7 @@ pub trait AgentHook: Send + Sync {
     }
 
     /// On every `AgentState` transition.
-    async fn on_state_transition(&self, _old: &AgentState, _new: &AgentState) {}
+    async fn on_state_transition(&self, _ctx: &ToolCtx, _old: &AgentState, _new: &AgentState) {}
 
     /// The turn's final answer, mutable before it lands in history and on
     /// screen — `on_response` hooks rewrite `text` in place.
@@ -200,9 +206,9 @@ impl HookChain {
     }
 
     /// `on_state_transition` chain — awaited inline.
-    pub async fn run_state_transition(&self, old: &AgentState, new: &AgentState) {
+    pub async fn run_state_transition(&self, ctx: &ToolCtx, old: &AgentState, new: &AgentState) {
         for h in self.snapshot() {
-            if tokio::time::timeout(HOOK_TIMEOUT, h.on_state_transition(old, new))
+            if tokio::time::timeout(HOOK_TIMEOUT, h.on_state_transition(ctx, old, new))
                 .await
                 .is_err()
             {
@@ -212,21 +218,24 @@ impl HookChain {
     }
 
     /// Observe a state the kernel just entered, awaiting the hooks.
-    pub async fn observe(&self, new: &AgentState) {
+    pub async fn observe(&self, ctx: &ToolCtx, new: &AgentState) {
         let Some(old) = self.take_transition(new) else {
             return;
         };
         if self.is_empty() {
             return;
         }
-        self.run_state_transition(&old, new).await;
+        self.run_state_transition(ctx, &old, new).await;
     }
 
     /// Observe a state without waiting — for the sync emit sites (`Engine::
     /// set_state` on the turn's hot path). A hook never delays the state the
     /// UI is about to render; outside a runtime the dispatch is skipped
     /// rather than blocking on it.
-    pub fn observe_nowait(&self, new: &AgentState) {
+    pub fn observe_nowait(&self, ctx: Arc<ToolCtx>, new: &AgentState) {
+        if crate::invocation_scope::is_invocation_scoped(&ctx) {
+            return;
+        }
         let Some(old) = self.take_transition(new) else {
             return;
         };
@@ -255,7 +264,7 @@ impl HookChain {
                             break;
                         };
                         let chain = HookChain { inner };
-                        chain.run_state_transition(&old, &new).await;
+                        chain.run_state_transition(&ctx, &old, &new).await;
                     }
                 });
                 *slot = Some(tx);
@@ -287,9 +296,9 @@ impl HookChain {
 
     /// `before_tool_execute` chain — any veto stops the tool, carrying the
     /// vetoing hook's reason to the model (empty → a generic line).
-    pub async fn run_before_tool(&self, call: &mut ToolCall) -> Result<(), String> {
+    pub async fn run_before_tool(&self, ctx: &ToolCtx, call: &mut ToolCall) -> Result<(), String> {
         for h in self.snapshot() {
-            match tokio::time::timeout(HOOK_TIMEOUT, h.before_tool_execute(call)).await {
+            match tokio::time::timeout(HOOK_TIMEOUT, h.before_tool_execute(ctx, call)).await {
                 Ok(Ok(())) => continue,
                 Ok(Err(e)) => {
                     // A veto is a decision, not a failure — its text IS the
@@ -310,9 +319,10 @@ impl HookChain {
     }
 
     /// `after_tool_execute` chain — hooks may mutate `output`.
-    pub async fn run_after_tool(&self, call: &ToolCall, output: &mut String) {
+    pub async fn run_after_tool(&self, ctx: &ToolCtx, call: &ToolCall, output: &mut String) {
         for h in self.snapshot() {
-            let _ = tokio::time::timeout(HOOK_TIMEOUT, h.after_tool_execute(call, output)).await;
+            let _ =
+                tokio::time::timeout(HOOK_TIMEOUT, h.after_tool_execute(ctx, call, output)).await;
         }
     }
 
@@ -336,7 +346,7 @@ mod tests {
         fn id(&self) -> &str {
             "count"
         }
-        async fn on_state_transition(&self, _o: &AgentState, _n: &AgentState) {
+        async fn on_state_transition(&self, _ctx: &ToolCtx, _o: &AgentState, _n: &AgentState) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -349,19 +359,26 @@ mod tests {
         let chain = HookChain::new();
         chain.replace(vec![counter.clone()]);
 
-        chain.observe(&AgentState::ScanningWorkspace).await;
+        chain
+            .observe(&ToolCtx::new(), &AgentState::ScanningWorkspace)
+            .await;
         assert_eq!(counter.0.load(Ordering::SeqCst), 1);
         // Same state again (the session mirroring the engine) — no event.
-        chain.observe(&AgentState::ScanningWorkspace).await;
+        chain
+            .observe(&ToolCtx::new(), &AgentState::ScanningWorkspace)
+            .await;
         assert_eq!(counter.0.load(Ordering::SeqCst), 1);
         // A real change fires, and a clone sees the same timeline.
         let clone = chain.clone();
-        clone.observe(&AgentState::Reasoning).await;
+        clone.observe(&ToolCtx::new(), &AgentState::Reasoning).await;
         assert_eq!(counter.0.load(Ordering::SeqCst), 2);
         chain
-            .observe(&AgentState::ExecutingTool {
-                tool_name: "bash".into(),
-            })
+            .observe(
+                &ToolCtx::new(),
+                &AgentState::ExecutingTool {
+                    tool_name: "bash".into(),
+                },
+            )
             .await;
         assert_eq!(counter.0.load(Ordering::SeqCst), 3);
     }
@@ -372,7 +389,7 @@ mod tests {
         let counter = Arc::new(Count(AtomicUsize::new(0)));
         let chain = HookChain::new();
         chain.replace(vec![counter.clone()]);
-        chain.observe_nowait(&AgentState::Reasoning);
+        chain.observe_nowait(Arc::new(ToolCtx::new()), &AgentState::Reasoning);
         // The dispatch is spawned; yield so it runs.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(counter.0.load(Ordering::SeqCst), 1);
@@ -383,8 +400,8 @@ mod tests {
     async fn empty_chain_is_inert() {
         let chain = HookChain::new();
         assert!(chain.is_empty());
-        chain.observe(&AgentState::Reasoning).await;
-        chain.observe_nowait(&AgentState::Finished);
+        chain.observe(&ToolCtx::new(), &AgentState::Reasoning).await;
+        chain.observe_nowait(Arc::new(ToolCtx::new()), &AgentState::Finished);
         // No hook ran, and the slot still tracked the change.
         assert_eq!(chain.take_transition(&AgentState::Finished), None);
     }
@@ -398,7 +415,11 @@ mod tests {
             fn id(&self) -> &str {
                 "veto"
             }
-            async fn before_tool_execute(&self, _c: &mut ToolCall) -> anyhow::Result<()> {
+            async fn before_tool_execute(
+                &self,
+                _ctx: &ToolCtx,
+                _c: &mut ToolCall,
+            ) -> anyhow::Result<()> {
                 Err(anyhow::anyhow!(self.0))
             }
         }
@@ -411,13 +432,19 @@ mod tests {
             arguments: "{}".into(),
         };
         assert_eq!(
-            chain.run_before_tool(&mut call).await.unwrap_err(),
+            chain
+                .run_before_tool(&ToolCtx::new(), &mut call)
+                .await
+                .unwrap_err(),
             "no push today"
         );
 
         let chain = HookChain::new();
         chain.replace(vec![Arc::new(Veto(""))]);
-        let err = chain.run_before_tool(&mut call).await.unwrap_err();
+        let err = chain
+            .run_before_tool(&ToolCtx::new(), &mut call)
+            .await
+            .unwrap_err();
         assert!(err.contains("veto"), "{err}");
     }
 
@@ -432,7 +459,11 @@ mod tests {
             fn id(&self) -> &str {
                 "slow"
             }
-            async fn before_tool_execute(&self, _c: &mut ToolCall) -> anyhow::Result<()> {
+            async fn before_tool_execute(
+                &self,
+                _ctx: &ToolCtx,
+                _c: &mut ToolCall,
+            ) -> anyhow::Result<()> {
                 // Two of these exceed one HOOK_TIMEOUT; each alone does not.
                 tokio::time::sleep(HOOK_TIMEOUT / 2 + Duration::from_millis(100)).await;
                 Ok(())
@@ -444,7 +475,11 @@ mod tests {
             fn id(&self) -> &str {
                 self.0
             }
-            async fn before_tool_execute(&self, _c: &mut ToolCall) -> anyhow::Result<()> {
+            async fn before_tool_execute(
+                &self,
+                _ctx: &ToolCtx,
+                _c: &mut ToolCall,
+            ) -> anyhow::Result<()> {
                 self.1.lock().unwrap().push(self.0);
                 if self.0 == "veto" {
                     anyhow::bail!("denied");
@@ -461,7 +496,10 @@ mod tests {
             name: "bash".into(),
             arguments: "{}".into(),
         };
-        assert!(layered.run_before_tool(&mut call).await.is_ok());
+        assert!(layered
+            .run_before_tool(&ToolCtx::new(), &mut call)
+            .await
+            .is_ok());
 
         // A reload of the shared chain reaches the layered one.
         shared.replace(vec![
@@ -471,13 +509,18 @@ mod tests {
         ]);
         assert_eq!(layered.ids(), vec!["local", "slow", "slow", "veto"]);
         assert_eq!(
-            layered.run_before_tool(&mut call).await.unwrap_err(),
+            layered
+                .run_before_tool(&ToolCtx::new(), &mut call)
+                .await
+                .unwrap_err(),
             "denied"
         );
         assert_eq!(*order.lock().unwrap(), vec!["local", "local", "veto"]);
 
         // Both chains share one transition timeline.
-        layered.observe(&AgentState::Reasoning).await;
+        layered
+            .observe(&ToolCtx::new(), &AgentState::Reasoning)
+            .await;
         assert_eq!(shared.take_transition(&AgentState::Reasoning), None);
     }
 }

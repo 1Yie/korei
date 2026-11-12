@@ -19,7 +19,12 @@ struct Policy;
 #[async_trait::async_trait]
 impl TurnPolicy for Policy {
     fn begin_turn(&self) {}
-    async fn before_dispatch(&self, _tool: &str, _is_readonly: bool) -> Option<String> {
+    async fn before_dispatch(
+        &self,
+        _: &agent_kernel::tools::ToolCtx,
+        _tool: &str,
+        _is_readonly: bool,
+    ) -> Option<String> {
         None
     }
     async fn on_quiet_round(&self, view: &dyn TurnView) -> Verdict {

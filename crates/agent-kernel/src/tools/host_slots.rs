@@ -23,9 +23,11 @@ pub struct ToolVerdict {
 /// card offered, `path` the path the tool refused. Installed by a host that
 /// can widen a session's reach (linked workspaces); without it the kernel has
 /// nowhere to send the question, so a refusal stays a plain refusal.
-pub struct ScopeGrantSlot(
-    pub Arc<dyn Fn(&str, &str, &str) -> Result<(), String> + Send + Sync>,
-);
+pub type ScopeGrant = dyn for<'a> Fn(&'a str, &'a str, &'a str) -> futures::future::BoxFuture<'a, Result<(), String>>
+    + Send
+    + Sync;
+
+pub struct ScopeGrantSlot(pub Arc<ScopeGrant>);
 
 use super::registry::{ToolCtx, ToolError};
 
@@ -220,7 +222,12 @@ impl AskChannel {
     /// `AnswerQuestion` writes here — resolves the parked oneshot when the
     /// id matches (a stale answer for a cleared question is ignored).
     pub fn answer(&self, request_id: u64, answer: String) -> bool {
-        match self.pending.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        match self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             Some((id, tx)) if id == request_id => tx.send(answer).is_ok(),
             Some(p) => {
                 *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(p);
@@ -278,10 +285,7 @@ impl ToolCtx {
 
     /// Install the grant callback. The kernel offers `action` as an approval
     /// choice, so the ids it passes back are the ones the host put on the card.
-    pub fn install_scope_grant(
-        &mut self,
-        grant: Arc<dyn Fn(&str, &str, &str) -> Result<(), String> + Send + Sync>,
-    ) {
+    pub fn install_scope_grant(&mut self, grant: Arc<ScopeGrant>) {
         self.ext.insert(Arc::new(ScopeGrantSlot(grant)));
     }
 
@@ -294,8 +298,14 @@ impl ToolCtx {
     /// Perform the chosen grant. `None` when no host installed one.
     /// `access` is `"read"` or `"readwrite"`: a grant for reading a
     /// dependency is not the same permission as one for editing it.
-    pub fn grant_scope(&self, action: &str, path: &str, access: &str) -> Option<Result<(), String>> {
-        self.ext.get::<ScopeGrantSlot>().map(|s| (s.0)(action, path, access))
+    pub async fn grant_scope(
+        &self,
+        action: &str,
+        path: &str,
+        access: &str,
+    ) -> Option<Result<(), String>> {
+        let slot = self.ext.get::<ScopeGrantSlot>()?;
+        Some((slot.0)(action, path, access).await)
     }
 
     /// The session UI event sink, if this context has one. Tools that fan out
@@ -335,6 +345,9 @@ impl ToolCtx {
 
     /// The plugin router handle, if one is installed.
     pub fn plugins(&self) -> Option<crate::engine::PluginHandle> {
+        if let Some(binding) = self.ext.get::<crate::invocation_scope::ScopeBinding>() {
+            return binding.plugins.clone();
+        }
         self.ext.get::<PluginSlot>().map(|s| s.0.clone())
     }
 

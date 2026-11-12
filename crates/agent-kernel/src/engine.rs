@@ -775,7 +775,7 @@ impl Engine {
         history: &mut Vec<ChatMessage>,
         notice_turn: bool,
     ) -> Result<TurnOutcome, String> {
-        self.set_state(io, AgentState::Reasoning);
+        self.set_state(io, AgentState::Reasoning).await;
 
         // The per-round sanitize + compaction check below own both the
         // turn-start pass and every mid-turn tool round (one code path).
@@ -801,7 +801,8 @@ impl Engine {
             // sample/tool round so a Cancel lands between model calls even
             // if no chunk is flowing.
             if io.cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                self.set_state(io, AgentState::Failed(CANCEL_ERR.into()));
+                self.set_state(io, AgentState::Failed(CANCEL_ERR.into()))
+                    .await;
                 let _ = io.ui_tx.send(UiEvent::SystemMessage(CANCEL_TEXT.into()));
                 history.push(ChatMessage::notice(CANCEL_TEXT));
                 return Err(CANCEL_ERR.into());
@@ -1112,7 +1113,8 @@ impl Engine {
                     );
                 }
                 history.push(ChatMessage::notice(CANCEL_TEXT));
-                self.set_state(io, AgentState::Failed(CANCEL_ERR.into()));
+                self.set_state(io, AgentState::Failed(CANCEL_ERR.into()))
+                    .await;
                 let _ = io.ui_tx.send(UiEvent::SystemMessage(CANCEL_TEXT.into()));
                 return Err(CANCEL_ERR.into());
             }
@@ -1131,7 +1133,7 @@ impl Engine {
                     let _ = io.ui_tx.send(UiEvent::SystemMessage(line.into()));
                     history.push(ChatMessage::notice(line));
                 }
-                self.set_state(io, AgentState::Failed(e.to_string()));
+                self.set_state(io, AgentState::Failed(e.to_string())).await;
                 let _ = io.ui_tx.send(UiEvent::Error(e.to_string()));
                 history.push(ChatMessage::notice_error(e.to_string()));
                 return Err(e.to_string());
@@ -1149,7 +1151,7 @@ impl Engine {
                     );
                 }
                 history.push(ChatMessage::notice_error(e.clone()));
-                self.set_state(io, AgentState::Failed(e.clone()));
+                self.set_state(io, AgentState::Failed(e.clone())).await;
                 let _ = io.ui_tx.send(UiEvent::Error(e.clone()));
                 return Err(e);
             }
@@ -1246,7 +1248,7 @@ impl Engine {
                     duration_ms: reasoning_ms,
                     provider_state: round_provider_state.take(),
                 });
-                self.set_state(io, AgentState::Finished);
+                self.set_state(io, AgentState::Finished).await;
                 let _ = io.ui_tx.send(UiEvent::AssistantMessage(final_text.clone()));
                 for effect in after_final {
                     land_effect(effect, history, io);
@@ -1320,13 +1322,15 @@ impl Engine {
                 };
                 history.push(message.with_duration_ms(Some(outcome.audit.duration_ms)));
                 if cancelled {
-                    return self.abort_cancelled(
-                        io,
-                        history,
-                        &calls,
-                        call_idx + 1,
-                        "cancelled before dispatch",
-                    );
+                    return self
+                        .abort_cancelled(
+                            io,
+                            history,
+                            &calls,
+                            call_idx + 1,
+                            "cancelled before dispatch",
+                        )
+                        .await;
                 }
             }
 
@@ -1341,7 +1345,7 @@ impl Engine {
                 force_no_tools = true;
             }
 
-            self.set_state(io, AgentState::Reasoning);
+            self.set_state(io, AgentState::Reasoning).await;
         }
     }
 
@@ -1352,7 +1356,7 @@ impl Engine {
     /// (strict providers reject it) and makes a reloaded view silently drop
     /// chips the live view had. Every queued invocation receives its terminal
     /// event, including calls cancelled before dispatch.
-    fn abort_cancelled(
+    async fn abort_cancelled(
         &mut self,
         io: &mut EngineIo,
         history: &mut Vec<ChatMessage>,
@@ -1373,7 +1377,8 @@ impl Engine {
             history.push(ChatMessage::tool_result_err(pending_call.id.clone(), label));
         }
         history.push(ChatMessage::notice(CANCEL_TEXT));
-        self.set_state(io, AgentState::Failed(CANCEL_ERR.into()));
+        self.set_state(io, AgentState::Failed(CANCEL_ERR.into()))
+            .await;
         let _ = io.ui_tx.send(UiEvent::SystemMessage(CANCEL_TEXT.into()));
         Err(CANCEL_ERR.into())
     }
@@ -1392,7 +1397,7 @@ impl Engine {
         {
             return;
         }
-        self.set_state(io, AgentState::Compacting);
+        self.set_state(io, AgentState::Compacting).await;
         match self.compact_history(io, history, /*manual*/ false).await {
             Ok(_) => {
                 // The card row + `UiEvent::Compacted` already went out from
@@ -1407,7 +1412,7 @@ impl Engine {
                 history.push(ChatMessage::notice(line));
             }
         }
-        self.set_state(io, AgentState::Reasoning);
+        self.set_state(io, AgentState::Reasoning).await;
     }
 
     /// Compaction: split history keeping ~25% as the verbatim suffix →
@@ -1563,6 +1568,8 @@ impl Engine {
     async fn ask_scope_grant(
         &self,
         io: &EngineIo,
+        ctx: &ToolCtx,
+        hooks: &crate::hooks::HookChain,
         call: &agent_llm_core::types::ToolCall,
         path: &str,
         suggestion: Option<&str>,
@@ -1573,7 +1580,7 @@ impl Engine {
     ) -> Result<(String, String, u64), String> {
         const LINK_SESSION: &str = "link:session";
         const LINK_PERSIST: &str = "link:workspace";
-        if !self.ctx.has_scope_grant() {
+        if !ctx.has_scope_grant() {
             return Err(format!("path escapes workspace: {path}"));
         }
         if !self
@@ -1620,13 +1627,16 @@ impl Engine {
         let request_id = next_request_id();
         audit.scope_approval_request_id = Some(request_id);
         let _route = self.route_child_approval(request_id);
-        self.set_state(
-            io,
-            AgentState::AwaitingToolConfirmation {
-                tool_name: call.name.clone(),
-                diff_summary: diff.clone(),
-            },
-        );
+        let state = AgentState::AwaitingToolConfirmation {
+            tool_name: call.name.clone(),
+            diff_summary: diff.clone(),
+        };
+        if crate::invocation_scope::is_invocation_scoped(ctx) {
+            let _ = io.ui_tx.send(UiEvent::StateChanged(state.clone()));
+            hooks.observe(ctx, &state).await;
+        } else {
+            self.set_state(io, state).await;
+        }
         let _ = io.ui_tx.send(UiEvent::ApprovalRequested {
             request_id,
             tool_name: call.name.clone(),
@@ -1638,12 +1648,15 @@ impl Engine {
         let wait = self
             .wait_for_decision(request_id, &io.cancel, deadline)
             .await;
-        self.set_state(
-            io,
-            AgentState::ExecutingTool {
-                tool_name: call.name.clone(),
-            },
-        );
+        let state = AgentState::ExecutingTool {
+            tool_name: call.name.clone(),
+        };
+        if crate::invocation_scope::is_invocation_scoped(ctx) {
+            let _ = io.ui_tx.send(UiEvent::StateChanged(state.clone()));
+            hooks.observe(ctx, &state).await;
+        } else {
+            self.set_state(io, state).await;
+        }
         let verdict = match wait {
             DecisionWait::Verdict(v) => v,
             DecisionWait::Cancelled => {
@@ -1745,11 +1758,20 @@ impl Engine {
         }
     }
 
-    fn set_state(&self, io: &EngineIo, state: AgentState) {
-        // Lifecycle hooks observe the transition fire-and-forget: a hook must
-        // never delay the state the UI is about to render.
-        self.hooks.observe_nowait(&state);
-        let _ = io.ui_tx.send(UiEvent::StateChanged(state));
+    async fn set_state(&self, io: &EngineIo, state: AgentState) {
+        let _ = io.ui_tx.send(UiEvent::StateChanged(state.clone()));
+        if let Some(binding) = self.ctx.ext.get::<crate::invocation_scope::ScopeBinding>() {
+            tokio::select! {
+                biased;
+                _ = binding.cancelled() => {}
+                _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    binding.hooks.observe(&self.ctx, &state),
+                ) => {}
+            }
+        } else {
+            self.hooks.observe_nowait(self.ctx.clone(), &state);
+        }
     }
 }
 

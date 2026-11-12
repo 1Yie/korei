@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::invocation_scope::{InvocationScope, ScopeBinding};
 use agent_ipc::events::{AgentState, UiEvent};
 use agent_llm_core::types::{ImageRef, ToolCall};
 use agent_tool::{CallRisk, ToolError, ToolResult};
@@ -247,6 +248,7 @@ pub struct InvocationGateway<'turn> {
     audit: Option<&'turn dyn AuditSink>,
     parent: Option<String>,
     deadline: Option<Instant>,
+    scope: Option<&'turn InvocationScope>,
 }
 
 impl Engine {
@@ -269,6 +271,7 @@ impl Engine {
             audit,
             parent: None,
             deadline: None,
+            scope: None,
         }
     }
 }
@@ -312,7 +315,57 @@ fn plugin_description(value: Value) -> Result<ToolDescription, String> {
     })
 }
 
-impl InvocationGateway<'_> {
+impl<'turn> InvocationGateway<'turn> {
+    pub fn with_scope(mut self, scope: &'turn InvocationScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    fn ctx(&self) -> &Arc<crate::tools::registry::ToolCtx> {
+        self.scope.map_or(&self.engine.ctx, |scope| &scope.ctx)
+    }
+
+    fn binding(&self) -> Option<Arc<ScopeBinding>> {
+        self.ctx().ext.get::<ScopeBinding>()
+    }
+
+    fn hooks(&self) -> crate::hooks::HookChain {
+        self.binding()
+            .map_or_else(|| self.engine.hooks.clone(), |b| b.hooks.clone())
+    }
+
+    fn plugins(&self) -> Option<Arc<dyn PluginRouter>> {
+        match self.binding() {
+            Some(binding) => binding
+                .plugins
+                .as_ref()
+                .and_then(|h| h.read().ok().and_then(|g| g.clone())),
+            None => self.engine.plugins(),
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        match (self.deadline, self.binding().and_then(|b| b.deadline)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    async fn set_state(
+        &self,
+        state: AgentState,
+        outcome: &mut InvocationOutcome,
+    ) -> Result<(), String> {
+        if let Some(binding) = self.binding() {
+            let _ = self.io.ui_tx.send(UiEvent::StateChanged(state.clone()));
+            self.active(binding.hooks.observe(self.ctx(), &state), outcome)
+                .await
+        } else {
+            self.engine.set_state(self.io, state).await;
+            Ok(())
+        }
+    }
+
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(
             self.deadline
@@ -322,6 +375,9 @@ impl InvocationGateway<'_> {
     }
     /// Compact metadata only; schemas are obtained one at a time with `describe`.
     pub fn list(&self) -> Result<Vec<ToolMetadata>, String> {
+        if let Some(binding) = self.binding() {
+            binding.check_open()?;
+        }
         let registry = self.engine.active_registry();
         let mut tools = Vec::new();
         let mut names = HashSet::new();
@@ -339,7 +395,7 @@ impl InvocationGateway<'_> {
             });
         }
         if self.engine.plugins_allowed() {
-            if let Some(router) = self.engine.plugins() {
+            if let Some(router) = self.plugins() {
                 for value in router.exported_tools() {
                     let description = plugin_description(value)?;
                     if names.insert(description.metadata.name.clone()) {
@@ -352,6 +408,9 @@ impl InvocationGateway<'_> {
     }
 
     pub fn describe(&self, name: &str) -> Result<ToolDescription, String> {
+        if let Some(binding) = self.binding() {
+            binding.check_open()?;
+        }
         let registry = self.engine.active_registry();
         let resolved = self.resolve(&registry, name)?;
         crate::schema::validator(resolved.schema())?;
@@ -385,7 +444,7 @@ impl InvocationGateway<'_> {
             return Ok(ResolvedTool::Builtin(spec));
         }
         if self.engine.plugins_allowed() {
-            if let Some(router) = self.engine.plugins() {
+            if let Some(router) = self.plugins() {
                 for value in router.exported_tools() {
                     let description = plugin_description(value)?;
                     if description.metadata.name == name {
@@ -489,9 +548,24 @@ impl InvocationGateway<'_> {
 
     pub(super) fn invoke_queued(
         &self,
-        request: InvocationRequest,
+        mut request: InvocationRequest,
     ) -> BoxFuture<'_, InvocationOutcome> {
         async move {
+            let binding = self.binding();
+            if let Some(binding) = &binding {
+                request.metadata.execution_id = Some(binding.identity.execution_id.clone());
+                request.metadata.agent_id = Some(binding.identity.agent_id.clone());
+                request.metadata.session_id = Some(binding.identity.session_id.clone());
+                request.metadata.trace_id = binding.identity.trace_id.clone();
+                if self.parent.is_none() {
+                    request.metadata.parent_call_id = binding.identity.parent_call_id.clone();
+                }
+            }
+            let sink = binding
+                .as_ref()
+                .and_then(|b| b.audit.as_deref())
+                .or_else(|| if binding.is_none() { self.audit } else { None });
+            let lease = binding.as_ref().map(|b| b.lifetime.enter()).transpose();
             let mut terminal = TerminalGuard {
                 ui: self.io.ui_tx.clone(),
                 call: request.call.clone(),
@@ -567,7 +641,7 @@ impl InvocationGateway<'_> {
             let mut began = false;
             if !metadata_ok || request.call.arguments.len() > crate::schema::MAX_ARGUMENT_BYTES {
                 outcome.content = "invocation metadata or arguments exceed limits".into();
-            } else if let Some(audit) = self.audit {
+            } else if let Some(audit) = sink {
                 let record = InvocationStart {
                     metadata: request.metadata.clone(),
                     requested_call: request.call.clone(),
@@ -580,6 +654,11 @@ impl InvocationGateway<'_> {
                         outcome.audit_error = Some(error);
                     }
                 }
+            }
+            if let Err(error) = &lease {
+                outcome.content = error.clone();
+                outcome.status = InvocationStatus::Cancelled;
+                outcome.audit.stop_reason = Some(InvocationStopReason::Cancelled);
             }
             if outcome.content.is_empty() {
                 if let Some(reason) = &request.rejection {
@@ -597,7 +676,8 @@ impl InvocationGateway<'_> {
             if outcome.dispatched && !self.io.cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(call) = outcome.audit.authorized_call.clone() {
                     let mut content = std::mem::take(&mut outcome.content);
-                    let after = self.engine.hooks.run_after_tool(&call, &mut content);
+                    let hooks = self.hooks();
+                    let after = hooks.run_after_tool(self.ctx(), &call, &mut content);
                     // After hooks cannot hold terminal cleanup open.
                     let _ = tokio::time::timeout(AUDIT_IO_BUDGET, self.active(after, &mut outcome))
                         .await;
@@ -613,7 +693,7 @@ impl InvocationGateway<'_> {
             outcome.audit.result_actual_bytes = outcome.content.len();
             outcome.audit.result_preview = clipped(&outcome.content, MAX_AUDIT_RESULT_BYTES);
             if began {
-                if let Some(audit) = self.audit {
+                if let Some(audit) = sink {
                     let finish =
                         tokio::time::timeout(AUDIT_IO_BUDGET, audit.finish(&outcome.audit))
                             .await
@@ -651,14 +731,18 @@ impl InvocationGateway<'_> {
 
     fn check_cancel(&self, outcome: &mut InvocationOutcome) -> Result<(), String> {
         if self
-            .deadline
+            .deadline()
             .is_some_and(|d| tokio::time::Instant::now().into_std() >= d)
         {
             outcome.status = InvocationStatus::TimedOut;
             outcome.audit.stop_reason = Some(InvocationStopReason::InvocationDeadline);
             return Err("invocation deadline exceeded".into());
         }
-        if self.io.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        if self.io.cancel.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .binding()
+                .is_some_and(|b| b.lifetime.cancel.load(std::sync::atomic::Ordering::Acquire))
+        {
             outcome.status = InvocationStatus::Cancelled;
             outcome.audit.stop_reason = Some(InvocationStopReason::Cancelled);
             Err("cancelled while running".into())
@@ -678,7 +762,7 @@ impl InvocationGateway<'_> {
             tokio::select! {
                 biased;
                 _ = async {
-                    match self.deadline {
+                    match self.deadline() {
                         Some(d) => tokio::time::sleep_until(d.into()).await,
                         None => futures::future::pending().await,
                     }
@@ -717,7 +801,12 @@ impl InvocationGateway<'_> {
         outcome: &mut InvocationOutcome,
     ) -> Result<(), String> {
         self.check_cancel(outcome)?;
-        if let Some(audit) = self.audit {
+        let binding = self.binding();
+        let sink = binding
+            .as_ref()
+            .and_then(|b| b.audit.as_deref())
+            .or_else(|| if binding.is_none() { self.audit } else { None });
+        if let Some(audit) = sink {
             let record = InvocationEffect {
                 metadata: outcome.audit.metadata.clone(),
                 reviewed_call: call.clone(),
@@ -744,7 +833,19 @@ impl InvocationGateway<'_> {
         };
         self.check_cancel(outcome).map_err(ToolError::Failed)?;
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<NestedRequest>(NESTED_QUEUE);
-        let mut ctx = self.engine.ctx.with_cancel(self.io.cancel.clone());
+        let call_cancel = if self.binding().is_some() {
+            Arc::new(std::sync::atomic::AtomicBool::new(false))
+        } else {
+            self.io.cancel.clone()
+        };
+        let mut ctx = self.ctx().with_cancel(call_cancel.clone());
+        *ctx.active_registry
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(self.engine.active_registry());
+        ctx.ext
+            .insert(Arc::new(crate::invocation_scope::InvocationParent(
+                outcome.audit.metadata.invocation_id.clone(),
+            )));
         ctx.ext.insert(Arc::new(NestedDispatcher { sender }));
         let ctx = Arc::new(ctx);
         let future: BoxFuture<'_, Result<ToolResult, ToolError>> = match resolved {
@@ -766,6 +867,7 @@ impl InvocationGateway<'_> {
         let mut flags =
             std::collections::HashMap::<usize, Arc<std::sync::atomic::AtomicBool>>::new();
         let mut next_id = 0usize;
+        let mut cancelled_at = None;
         let parent_metadata = outcome.audit.metadata.clone();
         let parent_call = outcome
             .audit
@@ -775,12 +877,17 @@ impl InvocationGateway<'_> {
             .unwrap_or_else(|| parent_metadata.invocation_id.clone());
         loop {
             if self.check_cancel(outcome).is_err() {
+                call_cancel.store(true, std::sync::atomic::Ordering::Release);
+                let since = cancelled_at.get_or_insert_with(Instant::now);
                 receiver.close();
                 accepting = false;
                 for flag in flags.values() {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
-                if !cancel_aware && tool.is_some() {
+                if (!cancel_aware
+                    || (self.binding().is_some() && since.elapsed() >= AUDIT_IO_BUDGET))
+                    && tool.is_some()
+                {
                     tool = None;
                     result = Some(Err(ToolError::Failed(
                         if outcome.status == InvocationStatus::TimedOut {
@@ -811,7 +918,7 @@ impl InvocationGateway<'_> {
                     metadata.invocation_id = request.call.id.clone();
                     metadata.parent_call_id = Some(parent_call.clone());
                     if metadata.agent_id.is_none() { metadata.agent_id = self.engine.child_id().map(|id| id.to_string()); }
-                    if metadata.session_id.is_none() { metadata.session_id = self.engine.ctx.session().map(|id| id.to_string()); }
+                    if metadata.session_id.is_none() { metadata.session_id = self.ctx().session().map(|id| id.to_string()); }
                     let parent = name.to_string();
                     pending.push(async move {
                         let (_steer, steer_rx) = tokio::sync::mpsc::channel(1);
@@ -820,7 +927,8 @@ impl InvocationGateway<'_> {
                         let gateway = InvocationGateway {
                             engine: self.engine, io: &io, turn: self.turn, audit: self.audit,
                             parent: Some(parent),
-                            deadline: Some(self.deadline.map_or(request.deadline, |d| d.min(request.deadline))),
+                            deadline: Some(self.deadline().map_or(request.deadline, |d| d.min(request.deadline))),
+                            scope: self.scope,
                         };
                         let outcome = gateway.invoke(InvocationRequest {
                             call: request.call, metadata, observation_only: true, rejection: request.rejection,
@@ -875,19 +983,31 @@ impl InvocationGateway<'_> {
                 let approval = self.active(self.turn.approval.lock(), outcome).await?;
                 self.check_cancel(outcome)?;
                 self.scope_allowed(resolved, call, risk, diff, action, outcome)?;
-                let (grant_action, access, request_id) = self
-                    .engine
-                    .ask_scope_grant(
-                        self.io,
-                        call,
-                        &path,
-                        suggestion.as_deref(),
-                        resolved.readonly() || risk == CallRisk::Readonly,
-                        self.deadline,
-                        &mut outcome.status,
-                        &mut outcome.audit,
+                let mut status = outcome.status.clone();
+                let mut audit = outcome.audit.clone();
+                let hooks = self.hooks();
+                let wait = self
+                    .active(
+                        self.engine.ask_scope_grant(
+                            self.io,
+                            self.ctx(),
+                            &hooks,
+                            call,
+                            &path,
+                            suggestion.as_deref(),
+                            resolved.readonly() || risk == CallRisk::Readonly,
+                            self.deadline(),
+                            &mut status,
+                            &mut audit,
+                        ),
+                        outcome,
                     )
-                    .await?;
+                    .await;
+                outcome.audit.scope_approval_request_id = audit.scope_approval_request_id;
+                let result = wait?;
+                outcome.status = status;
+                outcome.audit.stop_reason = audit.stop_reason;
+                let (grant_action, access, request_id) = result?;
                 outcome.audit.scope_approval_request_id = Some(request_id);
                 self.check_cancel(outcome)?;
                 drop(approval);
@@ -912,7 +1032,13 @@ impl InvocationGateway<'_> {
                 self.scope_allowed(resolved, call, risk, diff, action, outcome)?;
                 self.check_cancel(outcome)?;
                 outcome.audit.effects_may_have_occurred = true;
-                match self.engine.ctx.grant_scope(&grant_action, &path, &access) {
+                match self
+                    .active(
+                        self.ctx().grant_scope(&grant_action, &path, &access),
+                        outcome,
+                    )
+                    .await?
+                {
                     Some(result) => result?,
                     None => return Err("this host cannot link directories".into()),
                 }
@@ -1053,7 +1179,7 @@ impl InvocationGateway<'_> {
         crate::schema::validate(initial.schema(), &args)?;
         self.check_cancel(outcome)?;
         let mut call = original.clone();
-        self.active(self.engine.hooks.run_before_tool(&mut call), outcome)
+        self.active(self.hooks().run_before_tool(self.ctx(), &mut call), outcome)
             .await??;
         call.id.clone_from(&original.id);
         if call.name.len() > MAX_METADATA_BYTES {
@@ -1077,7 +1203,7 @@ impl InvocationGateway<'_> {
         let (risk, review_summary, action, prepare) = match &resolved {
             ResolvedTool::Builtin(spec) => {
                 if let Some(review) = &spec.review {
-                    let review = review(&args, &self.engine.ctx);
+                    let review = review(&args, self.ctx());
                     if let Some(reason) = review.deny {
                         outcome.status = InvocationStatus::Denied;
                         outcome.denied = true;
@@ -1167,7 +1293,9 @@ impl InvocationGateway<'_> {
             self.check_cancel(outcome)?;
             if let Some(reason) = self
                 .active(
-                    self.engine.policy.before_dispatch(&call.name, readonly),
+                    self.engine
+                        .policy
+                        .before_dispatch(self.ctx(), &call.name, readonly),
                     outcome,
                 )
                 .await?
@@ -1203,13 +1331,14 @@ impl InvocationGateway<'_> {
         }
         outcome.audit.authorized_call = Some(call.clone());
         outcome.dispatched = true;
-        self.engine.set_state(
-            self.io,
+        self.set_state(
             AgentState::ExecutingTool {
                 tool_name: call.name.clone(),
             },
-        );
-        let result = if let Some(result) = staged {
+            outcome,
+        )
+        .await?;
+        let mut result = if let Some(result) = staged {
             result
         } else {
             self.dispatch_with_scope(
@@ -1224,16 +1353,7 @@ impl InvocationGateway<'_> {
             )
             .await?
         };
-        let ToolResult {
-            content,
-            ui_type,
-            commit,
-            images,
-            ..
-        } = result;
-        outcome.ui_type = ui_type.map(str::to_string);
-        outcome.images = images;
-        if let Some(commit) = commit {
+        if let Some(commit) = result.commit.take() {
             self.check_cancel(outcome)?;
             let agent_tool::Commit { verify, apply } = commit;
             verify()?;
@@ -1254,6 +1374,24 @@ impl InvocationGateway<'_> {
             outcome.audit.effects_may_have_occurred = true;
             self.active(apply, outcome).await??;
         }
+        let stop_reason = outcome.audit.stop_reason.clone();
+        let _ = tokio::time::timeout(
+            AUDIT_IO_BUDGET,
+            self.active(
+                self.engine.policy.after_execute(self.ctx(), &call, &result),
+                outcome,
+            ),
+        )
+        .await;
+        outcome.audit.stop_reason = stop_reason;
+        let ToolResult {
+            content,
+            ui_type,
+            images,
+            ..
+        } = result;
+        outcome.ui_type = ui_type.map(str::to_string);
+        outcome.images = images;
         outcome.content = content;
         outcome.status = InvocationStatus::Succeeded;
         Ok(())
@@ -1316,13 +1454,14 @@ impl InvocationGateway<'_> {
                 let request_id = next_request_id();
                 outcome.audit.approval_request_id = Some(request_id);
                 let _route = self.engine.route_child_approval(request_id);
-                self.engine.set_state(
-                    self.io,
+                self.set_state(
                     AgentState::AwaitingToolConfirmation {
                         tool_name: call.name.clone(),
                         diff_summary: diff_summary.clone(),
                     },
-                );
+                    outcome,
+                )
+                .await?;
                 let actions = Vec::new();
                 let _ = self.io.ui_tx.send(UiEvent::ApprovalRequested {
                     request_id,
@@ -1332,11 +1471,15 @@ impl InvocationGateway<'_> {
                     actions,
                     child_id: self.engine.child_id(),
                 });
-                match self
-                    .engine
-                    .wait_for_decision(request_id, &self.io.cancel, self.deadline)
-                    .await
-                {
+                let wait =
+                    self.engine
+                        .wait_for_decision(request_id, &self.io.cancel, self.deadline());
+                let verdict = if self.binding().is_some() {
+                    self.active(wait, outcome).await?
+                } else {
+                    wait.await
+                };
+                match verdict {
                     DecisionWait::Cancelled => {
                         outcome.status = InvocationStatus::Cancelled;
                         outcome.audit.stop_reason = Some(InvocationStopReason::Cancelled);

@@ -80,7 +80,20 @@ pub trait TurnPolicy: Send + Sync {
     /// `is_readonly` lets a policy snapshot state lazily before the first
     /// write. Returns `Some(message)` to refuse the call: the engine reports the
     /// message as the call's failed result and does not dispatch.
-    async fn before_dispatch(&self, tool: &str, is_readonly: bool) -> Option<String>;
+    async fn before_dispatch(
+        &self,
+        ctx: &crate::tools::registry::ToolCtx,
+        tool: &str,
+        is_readonly: bool,
+    ) -> Option<String>;
+
+    async fn after_execute(
+        &self,
+        _ctx: &crate::tools::registry::ToolCtx,
+        _call: &agent_llm_core::types::ToolCall,
+        _result: &agent_tool::ToolResult,
+    ) {
+    }
 
     /// Decide whether a quiet round may end the turn. What the turn changed is
     /// the policy's own knowledge: it observes its tools' effects itself.
@@ -97,7 +110,12 @@ pub struct NoopPolicy;
 #[async_trait::async_trait]
 impl TurnPolicy for NoopPolicy {
     fn begin_turn(&self) {}
-    async fn before_dispatch(&self, _tool: &str, _is_readonly: bool) -> Option<String> {
+    async fn before_dispatch(
+        &self,
+        _ctx: &crate::tools::registry::ToolCtx,
+        _tool: &str,
+        _is_readonly: bool,
+    ) -> Option<String> {
         None
     }
     async fn on_quiet_round(&self, _view: &dyn TurnView) -> Verdict {

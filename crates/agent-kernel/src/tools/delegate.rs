@@ -660,6 +660,7 @@ struct ChildHandle {
     /// Set once the task exists. Aborting it drops the child's turn future,
     /// which is what closes its card as interrupted.
     abort: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    scoped_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Everything the answering side needs, cloned out of the registry.
@@ -685,6 +686,7 @@ fn register_child(
     tx: tokio::sync::mpsc::Sender<ChildOutcome>,
     rx: tokio::sync::mpsc::Receiver<ChildOutcome>,
     background: bool,
+    scoped_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) -> (
     ChildRef,
     Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>>,
@@ -704,6 +706,7 @@ fn register_child(
         pending: pending.clone(),
         waiting: waiting.clone(),
         abort: abort.clone(),
+        scoped_cancel,
     };
     let mut guard = ACTIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
     guard
@@ -762,6 +765,16 @@ fn owned_child(session: i64, id: u64) -> Result<ChildRef, String> {
 fn abort_child(session: i64, id: u64) {
     let handle = {
         let mut guard = ACTIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(handle) = guard
+            .as_ref()
+            .and_then(|live| live.get(&id))
+            .filter(|h| h.session == session)
+        {
+            if let Some(cancel) = &handle.scoped_cancel {
+                cancel.store(true, std::sync::atomic::Ordering::Release);
+                return;
+            }
+        }
         match guard.as_mut() {
             Some(live) if live.get(&id).is_some_and(|h| h.session == session) => live.remove(&id),
             _ => None,
@@ -965,8 +978,9 @@ pub struct SubagentSpawner {
     /// it reads) — the host supplies a factory that installs the child's own
     /// pair and wraps it. Defaults to the kernel's no-op policy.
     policy: std::sync::Arc<
-        dyn Fn(&mut ToolCtx) -> Box<dyn crate::turn_policy::TurnPolicy> + Send + Sync,
+        dyn Fn(&ToolCtx, &mut ToolCtx) -> Box<dyn crate::turn_policy::TurnPolicy> + Send + Sync,
     >,
+    scoped_services: Option<Arc<crate::invocation_scope::ScopedChildFactory>>,
     host: Arc<dyn SubagentHost>,
     /// The parent's live gate. A child runs under the parent's mode and rules,
     /// so the answer to "may I do this" is the one the session already gave —
@@ -1002,9 +1016,10 @@ impl SubagentSpawner {
             registry_full: with_ask_parent(&registry_full),
             registry_readonly: with_ask_parent(&registry_readonly),
             host: Arc::new(NoopSubagentHost),
-            policy: std::sync::Arc::new(|_| {
+            policy: std::sync::Arc::new(|_, _| {
                 Box::new(crate::turn_policy::NoopPolicy) as Box<dyn crate::turn_policy::TurnPolicy>
             }),
+            scoped_services: None,
             parent_gate: None,
             child_approvals: false,
             handoffs: Arc::new(std::sync::Mutex::new(Default::default())),
@@ -1037,10 +1052,19 @@ impl SubagentSpawner {
     pub fn with_policy(
         mut self,
         policy: std::sync::Arc<
-            dyn Fn(&mut ToolCtx) -> Box<dyn crate::turn_policy::TurnPolicy> + Send + Sync,
+            dyn Fn(&ToolCtx, &mut ToolCtx) -> Box<dyn crate::turn_policy::TurnPolicy> + Send + Sync,
         >,
     ) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Build execution-bound services over the current parent and fresh child.
+    pub fn with_scoped_services(
+        mut self,
+        factory: Arc<crate::invocation_scope::ScopedChildFactory>,
+    ) -> Self {
+        self.scoped_services = Some(factory);
         self
     }
 
@@ -1218,6 +1242,23 @@ impl SubagentSpawner {
         label: &str,
         background: bool,
     ) -> Result<StartedChild, String> {
+        let scope = parent_ctx
+            .ext
+            .get::<crate::invocation_scope::ScopeBinding>();
+        let lease = if let Some(scope) = &scope {
+            scope.check_open()?;
+            if self.scoped_services.is_none() {
+                return Err("scoped delegation requires a scoped child services factory".into());
+            }
+            Some(scope.lifetime.enter()?)
+        } else {
+            None
+        };
+        let child_cancel = if scope.is_some() {
+            Arc::new(std::sync::atomic::AtomicBool::new(false))
+        } else {
+            cancel.clone()
+        };
         // Everything the child emits goes through its own sink and is forwarded
         // into the parent's stream tagged with this child's label — so a fan-out
         // shows what each child is doing, and drafting, under its own capsule.
@@ -1229,6 +1270,9 @@ impl SubagentSpawner {
         // which only another session-less caller can match.
         let owner = parent_ctx.session().unwrap_or(0);
         let child_id = register_steer(owner, steer_tx);
+        if let Some(scope) = &scope {
+            scope.lifetime.register_child(child_id);
+        }
         // The child's outcomes outlive this call: `run` returns at the first one,
         // and `answer_child` picks the thread up on a later parent turn.
         let (outcome_tx, outcome_rx) = tokio::sync::mpsc::channel(CHILD_OUTCOME_CAP);
@@ -1253,6 +1297,7 @@ impl SubagentSpawner {
             outcome_tx.clone(),
             outcome_rx,
             background,
+            scope.as_ref().map(|_| child_cancel.clone()),
         );
         let steers = SteerGuard(child_id);
         let entry = ChildGuard(child_id);
@@ -1265,7 +1310,7 @@ impl SubagentSpawner {
             // see the screen); input is not — `computer` is absent from every
             // child registry, and a refusing backend is the second guard
             // behind it for any path that constructs a child ctx itself.
-            cancel: Some(cancel.clone()),
+            cancel: Some(child_cancel.clone()),
             depth: parent_ctx.depth + 1,
             // The child's own engine refreshes this on its first dispatch.
             active_registry: std::sync::RwLock::new(None),
@@ -1328,7 +1373,24 @@ impl SubagentSpawner {
         // The child's turn contracts run the host's policy shape over the
         // child's own context — the factory installs the child's contract
         // controllers as part of that, so it needs the ctx mutable.
-        let policy = (self.policy)(&mut child_ctx);
+        let child_scope = if let Some(scope) = &scope {
+            let parent_call = parent_ctx
+                .ext
+                .get::<crate::invocation_scope::InvocationParent>()
+                .ok_or("scoped delegation requires a parent invocation")?;
+            let services = (self
+                .scoped_services
+                .as_ref()
+                .ok_or("missing scoped child services")?)(
+                &parent_ctx, &mut child_ctx
+            )?;
+            let binding = scope.child(child_id.to_string(), parent_call.0.clone(), services);
+            child_ctx.ext.insert(binding.clone());
+            Some(binding)
+        } else {
+            None
+        };
+        let policy = (self.policy)(&parent_ctx, &mut child_ctx);
         // The child's provider records the history of every request behind it, so
         // the mirror always holds what the child was last running on.
         let provider: Arc<dyn LlmProvider> = Arc::new(SnapshotProvider {
@@ -1343,6 +1405,12 @@ impl SubagentSpawner {
             route.temperature,
         );
         engine.set_policy(policy);
+        if let Some(binding) = &child_scope {
+            engine.set_hooks(binding.hooks.clone());
+            if let Some(plugins) = &binding.plugins {
+                engine.set_plugins(plugins.clone());
+            }
+        }
         // The child is bounded the way the turn that spawned it was bounded.
         // `can_ask` only decides whether an escalation pauses on a card or is
         // refused on the spot; it never widens what the parent may do.
@@ -1365,7 +1433,7 @@ impl SubagentSpawner {
             ui_tx,
             steer_rx,
             notice_rx: tokio::sync::mpsc::channel(4).1,
-            cancel: cancel.clone(),
+            cancel: child_cancel.clone(),
         };
         // The contract is always present; a custom manifest body is appended to
         // it, never substituted, so the no-questions and untrusted-data rules
@@ -1394,7 +1462,23 @@ impl SubagentSpawner {
             _entry: entry,
         };
         // Its own task: the child has to outlive this call while it waits on us.
-        let running = tokio::spawn(child_run.drive(task, preview));
+        let running = tokio::spawn(async move {
+            let _lease = lease;
+            let run = child_run.drive(task, preview);
+            tokio::pin!(run);
+            if let Some(scope) = scope {
+                tokio::select! {
+                    biased;
+                    _ = scope.cancelled() => {
+                        child_cancel.store(true, std::sync::atomic::Ordering::Release);
+                        let _ = tokio::time::timeout(std::time::Duration::from_secs(7), &mut run).await;
+                    }
+                    _ = &mut run => {}
+                }
+            } else {
+                run.await;
+            }
+        });
         *abort.lock().unwrap_or_else(|e| e.into_inner()) = Some(running.abort_handle());
 
         self.handoffs
@@ -1578,8 +1662,26 @@ fn detach(
 
     let notify = parent_ctx.ext.get::<ChildNotifier>();
     let parent = parent_ctx.clone();
+    let scope = parent_ctx
+        .ext
+        .get::<crate::invocation_scope::ScopeBinding>();
+    let lease = match scope.as_ref().map(|s| s.lifetime.enter()).transpose() {
+        Ok(lease) => lease,
+        Err(_) => return,
+    };
     tokio::spawn(async move {
-        while let Some((i, id, first)) = pending.next().await {
+        let _lease = lease;
+        loop {
+            let next = if let Some(scope) = &scope {
+                tokio::select! {
+                    biased;
+                    _ = scope.cancelled() => break,
+                    next = pending.next() => next,
+                }
+            } else {
+                pending.next().await
+            };
+            let Some((i, id, first)) = next else { break };
             let state = first.handoff_state();
             if let Some(text) = background_notice(&labels[i], id, first) {
                 match &notify {
@@ -1609,9 +1711,24 @@ fn detach_child(
 ) {
     let notify = ctx.ext.get::<ChildNotifier>();
     let parent = ctx.clone();
+    let scope = ctx.ext.get::<crate::invocation_scope::ScopeBinding>();
+    let lease = match scope.as_ref().map(|s| s.lifetime.enter()).transpose() {
+        Ok(lease) => lease,
+        Err(_) => return,
+    };
     tokio::spawn(async move {
+        let _lease = lease;
         let mut guard = AwaitGuard::arm(session, id, child.card.clone());
-        let first = first_outcome(session, id, &label, &child, &parent, &cancel).await;
+        let first = first_outcome(session, id, &label, &child, &parent, &cancel);
+        let first = if let Some(scope) = scope {
+            tokio::select! {
+                biased;
+                _ = scope.cancelled() => return,
+                first = first => first,
+            }
+        } else {
+            first.await
+        };
         guard.armed = false;
         let state = first.handoff_state();
         if let Some(text) = background_notice(&label, id, first) {
@@ -1675,6 +1792,10 @@ impl ChildRun {
             label.clone(),
             id,
             forward_stop.clone(),
+            parent
+                .ext
+                .get::<crate::invocation_scope::ScopeBinding>()
+                .map(|s| s.lifetime.retain()),
         );
         emit_child(&parent, id, &label, None, &preview);
         let start = std::time::Instant::now();
@@ -1732,9 +1853,11 @@ fn spawn_forwarder(
     tag: String,
     child_id: u64,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    lease: Option<crate::invocation_scope::ExecutionLease>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let parent_sink = parent_sink?;
     Some(tokio::spawn(async move {
+        let _lease = lease;
         // Drain-then-stop instead of waiting for every sink clone to drop: the
         // child's engine keeps one alive for its whole lifetime, so "all
         // senders gone" would never fire.
@@ -1944,10 +2067,25 @@ fn resolve_tasks(args: &DelegateArgs) -> Result<Vec<String>, String> {
 /// host. A turn's flag would be cleared by the next turn, so it cannot be it;
 /// without a host slot nothing can raise this one.
 fn background_cancel(ctx: &ToolCtx) -> Arc<std::sync::atomic::AtomicBool> {
+    if let Some(scope) = ctx.ext.get::<crate::invocation_scope::ScopeBinding>() {
+        return scope.lifetime.cancel.clone();
+    }
     ctx.ext
         .get::<BackgroundCancel>()
         .map(|slot| slot.0.clone())
         .unwrap_or_else(|| Arc::new(std::sync::atomic::AtomicBool::new(false)))
+}
+
+fn check_scoped_child(ctx: &ToolCtx, id: u64) -> Result<(), ToolError> {
+    if let Some(scope) = ctx.ext.get::<crate::invocation_scope::ScopeBinding>() {
+        scope.check_open().map_err(ToolError::Failed)?;
+        if !scope.lifetime.owns_child(id) {
+            return Err(ToolError::Failed(format!(
+                "no subagent with id {id} in this invocation scope"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, ToolError> {
@@ -2113,6 +2251,7 @@ pub fn wait_child_spec() -> ToolSpec {
 async fn wait_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, ToolError> {
     let parsed: WaitChildArgs =
         serde_json::from_value(args).map_err(|e| ToolError::Args(e.to_string()))?;
+    check_scoped_child(&ctx, parsed.child_id)?;
     let spawner = ctx
         .subagent()
         .map(|spawner| spawner.0.clone())
@@ -2287,6 +2426,7 @@ pub fn answer_child_spec() -> ToolSpec {
 async fn answer_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, ToolError> {
     let parsed: AnswerChildArgs =
         serde_json::from_value(args).map_err(|e| ToolError::Args(e.to_string()))?;
+    check_scoped_child(&ctx, parsed.child_id)?;
     let answer = parsed.answer.trim();
     if answer.is_empty() {
         return Err(ToolError::Args(
@@ -2401,6 +2541,7 @@ mod tests {
             "subagent #1".into(),
             7,
             stop.clone(),
+            None,
         )
         .expect("a parent sink means a forwarder runs");
 
@@ -2559,6 +2700,7 @@ mod tests {
             outcomes_tx,
             outcomes_rx,
             false,
+            None,
         );
         let _entry = ChildGuard(id);
 

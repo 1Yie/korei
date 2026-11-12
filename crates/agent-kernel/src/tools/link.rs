@@ -71,8 +71,8 @@ fn review(args: &Args, _: &std::sync::Arc<ToolCtx>) -> Review {
 }
 
 async fn exec(args: Args, ctx: std::sync::Arc<ToolCtx>) -> Result<ToolResult, ToolError> {
-    let parsed: LinkArgs =
-        serde_json::from_value(args).map_err(|e| ToolError::Args(format!("link_workspace: {e}")))?;
+    let parsed: LinkArgs = serde_json::from_value(args)
+        .map_err(|e| ToolError::Args(format!("link_workspace: {e}")))?;
     let path = parsed.path.trim();
     if path.is_empty() {
         return Err(ToolError::Args("`path` must name a directory".into()));
@@ -93,13 +93,15 @@ async fn exec(args: Args, ctx: std::sync::Arc<ToolCtx>) -> Result<ToolResult, To
             "this host cannot link directories — there is nothing installed to grant with".into(),
         ));
     }
-    match ctx.grant_scope(action, path, access) {
+    match ctx.grant_scope(action, path, access).await {
         Some(Ok(())) => Ok(ToolResult::text(format!(
             "linked {path} ({access}, {scope}) — the file tools and `bash` reach it now. Use its \
              absolute path: relative paths still resolve against the workspace."
         ))),
         Some(Err(msg)) => Err(ToolError::Failed(msg)),
-        None => Err(ToolError::Failed("this host cannot link directories".into())),
+        None => Err(ToolError::Failed(
+            "this host cannot link directories".into(),
+        )),
     }
 }
 
@@ -109,7 +111,7 @@ mod tests {
     use crate::tools::registry::ToolCtx;
     use std::sync::Arc;
 
-    fn ctx_with(grant: Option<Arc<dyn Fn(&str, &str, &str) -> Result<(), String> + Send + Sync>>) -> Arc<ToolCtx> {
+    fn ctx_with(grant: Option<Arc<crate::tools::host_slots::ScopeGrant>>) -> Arc<ToolCtx> {
         let mut ctx = ToolCtx::new();
         if let Some(g) = grant {
             ctx.install_scope_grant(g);
@@ -122,13 +124,10 @@ mod tests {
     #[tokio::test]
     async fn refuses_when_the_host_cannot_grant() {
         let ctx = ctx_with(None);
-        let err = exec(
-            serde_json::json!({"path": "/tmp/x"}),
-            ctx,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let err = exec(serde_json::json!({"path": "/tmp/x"}), ctx)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("cannot link directories"), "{err}");
     }
 
@@ -138,12 +137,14 @@ mod tests {
     async fn passes_the_action_access_and_path_to_the_host() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String, String)>::new()));
         let sink = seen.clone();
-        let ctx = ctx_with(Some(Arc::new(move |action: &str, path: &str, access: &str| {
-            sink.lock()
-                .unwrap()
-                .push((action.into(), path.into(), access.into()));
-            Ok(())
-        })));
+        let ctx = ctx_with(Some(Arc::new(
+            move |action: &str, path: &str, access: &str| {
+                sink.lock()
+                    .unwrap()
+                    .push((action.into(), path.into(), access.into()));
+                Box::pin(async { Ok(()) })
+            },
+        )));
         let out = exec(
             serde_json::json!({"path": "/w/kernel", "access": "read", "persist": true}),
             ctx,
@@ -166,15 +167,20 @@ mod tests {
     async fn an_unknown_access_label_reads_as_read() {
         let seen = Arc::new(std::sync::Mutex::new(Vec::<(String, String, String)>::new()));
         let sink = seen.clone();
-        let ctx = ctx_with(Some(Arc::new(move |action: &str, path: &str, access: &str| {
-            sink.lock()
-                .unwrap()
-                .push((action.into(), path.into(), access.into()));
-            Ok(())
-        })));
-        exec(serde_json::json!({"path": "/w", "access": "rw-everything"}), ctx)
-            .await
-            .unwrap();
+        let ctx = ctx_with(Some(Arc::new(
+            move |action: &str, path: &str, access: &str| {
+                sink.lock()
+                    .unwrap()
+                    .push((action.into(), path.into(), access.into()));
+                Box::pin(async { Ok(()) })
+            },
+        )));
+        exec(
+            serde_json::json!({"path": "/w", "access": "rw-everything"}),
+            ctx,
+        )
+        .await
+        .unwrap();
         assert_eq!(seen.lock().unwrap()[0].2, "read");
     }
 }

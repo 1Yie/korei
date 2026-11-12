@@ -12,6 +12,7 @@ pub mod channels;
 pub mod compaction;
 pub mod engine;
 pub mod hooks;
+pub mod invocation_scope;
 pub mod permissions;
 pub mod plugins;
 pub(crate) use agent_tool::schema;
