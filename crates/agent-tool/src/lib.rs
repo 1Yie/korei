@@ -7,6 +7,7 @@
 //! are context-free.
 
 use std::any::{Any, TypeId};
+pub mod schema;
 use std::collections::HashMap;
 use std::sync::Arc;
 
