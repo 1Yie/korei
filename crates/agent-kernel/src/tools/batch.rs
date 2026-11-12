@@ -27,6 +27,14 @@ const MAX_BATCH_CONCURRENCY: usize = 4;
 const MAX_NETWORK_CALLS: usize = 4;
 const MAX_BATCH_WALL: Duration = Duration::from_secs(30);
 const MAX_BATCH_OUTPUT: usize = 5 * 1024 * 1024;
+const CALLS_KEYS: [&str; 6] = [
+    "calls",
+    "items",
+    "tool_calls",
+    "batch",
+    "requests",
+    "operations",
+];
 
 /// The batch's own resource envelope — deadline is a BATCH deadline,
 /// not a per-item timeout; every item sees the remaining slice at start.
@@ -58,7 +66,7 @@ struct ItemOut {
     duration_ms: u64,
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, serde::Deserialize)]
 struct BatchCall {
     /// Tool name — must be an available observation tool. Mutations,
     /// delegation, questions, session state, and control signals are
@@ -281,13 +289,8 @@ fn parse_items(
     args: serde_json::Value,
     profile: &BatchProfile,
 ) -> Result<Vec<ParsedItem>, ToolError> {
-    let raw = if let Some(c) = args.get("calls") {
-        c.clone()
-    } else if let Some(alt) = ["items", "tool_calls", "batch", "requests", "operations"]
-        .iter()
-        .find_map(|k| args.get(*k))
-    {
-        alt.clone()
+    let raw = if let Some(calls) = CALLS_KEYS.iter().find_map(|k| args.get(*k)) {
+        calls.clone()
     } else if let Some(arr) = args.as_array() {
         // A bare `[{tool,args},…]` — the envelope key omitted entirely.
         serde_json::Value::Array(arr.clone())
@@ -336,21 +339,10 @@ fn parse_items(
         .collect())
 }
 
-#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
-struct BatchArgs {
-    /// Read only by `schema_for` — runtime parsing goes through `parse_items`,
-    /// which is lenient about the shapes models actually emit.
-    #[allow(dead_code)]
-
-    /// Up to 16 independent calls — results come back in THIS order.
-    calls: Vec<BatchCall>,
-}
-
 /// Generic description: names no tool, since the kernel ships none.
 const GENERIC_DESCRIPTION: &str = "The DEFAULT way to issue 2+ INDEPENDENT observation calls \
      — pack them into ONE round trip instead of firing read-only tools back to \
-     back. Args shape is always an object with a `calls` array, and every item \
-     MUST carry a `tool` string naming an available observation tool: \
+     back. Use an object with a `calls` array and a `tool` string naming an available observation tool on each item as the canonical form: \
      {\"calls\":[{\"tool\":\"<tool>\",\"args\":{}}]}. Only go sequential when \
      the next call's arguments depend on this call's result. Calls run at \
      limited concurrency (max 4, max 4 network calls); results return in the \
@@ -366,11 +358,25 @@ pub fn spec() -> ToolSpec {
 /// `batch_execute` described in terms of the host's own observation tools.
 pub fn spec_with(profile: BatchProfile) -> ToolSpec {
     let profile = Arc::new(profile);
+    let mut object_schema = serde_json::json!({
+        "anyOf": [{"required": ["tool"]}, {"required": ["function"]}]
+    });
+    // Envelope precedence matches parsing; item validation belongs to each
+    // nested invocation so a malformed item cannot reject its siblings.
+    for &key in CALLS_KEYS.iter().rev() {
+        object_schema = serde_json::json!({
+            "if": {"required": [key]},
+            "then": {"properties": {key: {"type": "array"}}},
+            "else": object_schema
+        });
+    }
+    object_schema["type"] = serde_json::json!("object");
     ToolSpec {
         name: "batch_execute",
-        schema: super::registry::schema_for::<BatchArgs>(
-            profile.description.unwrap_or(GENERIC_DESCRIPTION),
-        ),
+        schema: serde_json::json!({
+            "description": profile.description.unwrap_or(GENERIC_DESCRIPTION),
+            "parameters": {"anyOf": [{"type": "array"}, object_schema]}
+        }),
         readonly: true, // orchestrator — only ever runs auto-allowed Observation specs
         class: ToolClass::Orchestration,
         network: false,
@@ -737,6 +743,56 @@ mod tests {
             parse_items(serde_json::json!({"nope": 1}), &BatchProfile::default()).unwrap_err()
         );
         assert!(e.contains("missing field `calls`"), "{e}");
+    }
+
+    #[test]
+    fn schema_matches_parser_roots_and_leaves_items_to_nested_invocations() {
+        use serde_json::json;
+        let spec = spec();
+        let validator = crate::schema::validator(&spec.schema["parameters"]).unwrap();
+        let profile = BatchProfile::default();
+        let roots = [
+            serde_json::Value::Null,
+            json!(false),
+            json!(7),
+            json!("calls"),
+            json!([]),
+            json!([{}, 7, {"name":"probe","arguments":{"value":1}}]),
+            json!({}),
+            json!({"tool":null}),
+            json!({"function":{}}),
+            json!({"name":"probe"}),
+        ];
+        for root in &roots {
+            assert_eq!(
+                validator.validate(root).is_ok(),
+                parse_items(root.clone(), &profile).is_ok(),
+                "{root}"
+            );
+        }
+        for key in [
+            "calls",
+            "items",
+            "tool_calls",
+            "batch",
+            "requests",
+            "operations",
+        ] {
+            for value in &roots {
+                for tail in [json!({}), json!({"tool":"probe"}), json!({"operations":[]})] {
+                    let mut root = tail;
+                    root[key] = value.clone();
+                    assert_eq!(
+                        validator.validate(&root).is_ok(),
+                        parse_items(root.clone(), &profile).is_ok(),
+                        "{root}"
+                    );
+                }
+            }
+        }
+        assert!(validator
+            .validate(&json!({"calls":[],"items":false}))
+            .is_ok());
     }
 
     #[test]

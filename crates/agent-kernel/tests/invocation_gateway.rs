@@ -2681,10 +2681,75 @@ async fn batch_inner_schema_hook_review_policy_and_audit_cannot_be_bypassed() {
 }
 
 #[tokio::test]
+async fn batch_root_shapes_dispatch_and_invalid_roots_fail() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let mut probe = tool("probe", true, runs.clone());
+    probe.schema["parameters"]["additionalProperties"] = json!(true);
+    let (mut engine, io, mut rx) = harness(vec![agent_kernel::tools::batch::spec(), probe]);
+    let turn = engine.begin_invocation_turn();
+    let call = json!({"tool":"probe","args":{"value":1}});
+    let mut roots = vec![
+        json!([call.clone()]),
+        call.clone(),
+        json!({"function":{"name":"probe","arguments":{"value":1}}}),
+        json!({"calls":[call.clone()],"items":false}),
+    ];
+    for key in [
+        "calls",
+        "items",
+        "tool_calls",
+        "batch",
+        "requests",
+        "operations",
+    ] {
+        roots.push(json!({key:[call.clone()]}));
+    }
+    for (index, root) in roots.into_iter().enumerate() {
+        let outcome = engine
+            .invocation_gateway(&io, &turn, None)
+            .invoke(request("outer", "batch_execute", &root.to_string()))
+            .await;
+        assert!(outcome.ok(), "{root}: {}", outcome.content);
+        assert!(outcome.content.contains("1 calls · 1 ok · 0 failed"));
+        assert_eq!(runs.load(Ordering::SeqCst), index + 1);
+        assert_eq!(terminals(&mut rx), 2);
+    }
+    let successful = runs.load(Ordering::SeqCst);
+    for root in [
+        Value::Null,
+        json!(false),
+        json!(7),
+        json!("calls"),
+        json!({}),
+        json!({"name":"probe","arguments":{"value":1}}),
+        json!({"calls":{},"tool":"probe"}),
+        json!({"items":false,"requests":[call.clone()]}),
+        json!([]),
+        json!({"calls":[]}),
+        json!({"calls":vec![call; 17]}),
+    ] {
+        let outcome = engine
+            .invocation_gateway(&io, &turn, None)
+            .invoke(request("outer", "batch_execute", &root.to_string()))
+            .await;
+        assert_eq!(
+            outcome.status,
+            InvocationStatus::Failed,
+            "{root}: {}",
+            outcome.content
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), successful);
+        assert_eq!(terminals(&mut rx), 1);
+    }
+}
+
+#[tokio::test]
 async fn batch_inner_parallelism_partial_failure_and_missing_gateway_are_preserved() {
     let runs = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let mut probe = tool("probe", true, runs.clone());
+    // The parser preserves wrapper keys as inline arguments.
+    probe.schema["parameters"]["additionalProperties"] = json!(true);
     let count = runs.clone();
     probe.exec = Arc::new(move |_, _| {
         let barrier = barrier.clone();
@@ -2696,24 +2761,98 @@ async fn batch_inner_parallelism_partial_failure_and_missing_gateway_are_preserv
         }
         .boxed()
     });
-    let (mut engine, io, mut rx) = harness(vec![agent_kernel::tools::batch::spec(), probe]);
+    let batch = agent_kernel::tools::batch::spec_with(agent_kernel::tools::batch::BatchProfile {
+        infer: vec![(&["value"], "probe")],
+        ..Default::default()
+    });
+    let (mut engine, io, mut rx) = harness(vec![
+        batch,
+        probe,
+        tool("write", false, runs.clone()),
+        tool("blocked", true, runs.clone()),
+    ]);
+    engine.set_permissions(PermissionGate::new(
+        PermissionMode::Bypass,
+        PermissionRules {
+            deny: ["blocked".to_string()].into_iter().collect(),
+            ..Default::default()
+        },
+    ));
     let turn = engine.begin_invocation_turn();
+    let begins = Mutex::new(Vec::new());
+    let finishes = Mutex::new(Vec::new());
+    let sink = NestedAudit {
+        begins: &begins,
+        finishes: &finishes,
+        fail_inner: false,
+    };
     let outcome = tokio::time::timeout(
         Duration::from_secs(2),
         engine
-            .invocation_gateway(&io, &turn, None)
+            .invocation_gateway(&io, &turn, Some(&sink))
             .invoke(batch_request(json!([
                 {"tool":"probe","args":{"value":1}},
-                {"tool":"probe","args":{"value":2}},
-                {"tool":"probe","args":{"value":"invalid"}}
+                {"name":"probe","arguments":{"value":2}},
+                {"tool_name":"probe","value":3},
+                {"function":{"name":"probe","arguments":{"value":4}}},
+                {"args":{"value":5}},
+                {"value":6},
+                {"tool":{"name":"probe"},"args":{"value":7}},
+                {"call":"probe","args":{"value":8}},
+                {"command":"probe","args":{"value":9}},
+                {"action":"probe","args":{"value":10}},
+                {"orphan":true},
+                {"tool":"missing","args":{}},
+                {"tool":"write","args":{"value":11}},
+                {"tool":"blocked","args":{"value":12}},
+                {"args":{"value":"invalid"}},
+                {"tool":"probe","args":"{\"value\":13}"}
             ]))),
     )
     .await
     .expect("inner readonly calls must overlap");
-    assert!(outcome.ok());
-    assert_eq!(runs.load(Ordering::SeqCst), 2);
+    assert!(outcome.ok(), "{}", outcome.content);
+    assert_eq!(runs.load(Ordering::SeqCst), 10);
+    assert!(
+        outcome.content.contains("16 calls · 10 ok · 6 failed"),
+        "{}",
+        outcome.content
+    );
+    assert!(outcome.content.contains("item could not be parsed"));
+    assert!(outcome.content.contains("unknown tool"));
+    assert!(outcome.content.contains("only Observation"));
     assert!(outcome.content.contains("invalid tool arguments"));
-    assert_eq!(terminals(&mut rx), 4);
+    assert_eq!(terminals(&mut rx), 17);
+    let starts = begins.lock().unwrap();
+    let records = finishes.lock().unwrap();
+    assert_eq!(starts.len(), 17);
+    assert_eq!(records.len(), 17);
+    for start in starts
+        .iter()
+        .filter(|start| start.metadata.parent_call_id.is_some())
+    {
+        let record = records
+            .iter()
+            .find(|record| record.metadata.invocation_id == start.metadata.invocation_id)
+            .unwrap();
+        assert_eq!(start.metadata.parent_call_id.as_deref(), Some("outer"));
+        assert_eq!(start.metadata.execution_id.as_deref(), Some("execution"));
+        match start.requested_call.name.as_str() {
+            "missing" | "write" | "blocked" | "(unnamed)" => {
+                assert_eq!(record.status, InvocationStatus::Denied);
+                assert!(record.authorized_call.is_none());
+            }
+            "probe" if record.status == InvocationStatus::Succeeded => {
+                let call = record.authorized_call.as_ref().unwrap();
+                let args: Value = serde_json::from_str(&call.arguments).unwrap();
+                assert!(args["value"].is_i64());
+            }
+            "probe" => assert_eq!(record.status, InvocationStatus::Failed),
+            name => panic!("unexpected inner tool: {name}"),
+        }
+    }
+    drop(records);
+    drop(starts);
     let batch = agent_kernel::tools::batch::spec();
     let error = (batch.exec)(
         json!({"calls":[{"tool":"probe","args":{"value":1}}]}),

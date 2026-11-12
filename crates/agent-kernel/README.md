@@ -76,6 +76,13 @@ rechecks tool identity and permissions after asynchronous authorization work.
 ReAct and nested batch calls use this same invocation path. Child agents invoke
 tools under their own engine permissions.
 
+[`batch_execute`](src/tools/batch.rs) accepts its canonical calls envelope and
+the parser's alternate envelopes, bare arrays and single-call forms. Its shared
+schema checks the root structure; malformed items fail individually. Item
+aliases, inline arguments and host-declared signature inference normalize before
+nested gateway dispatch, which retains argument validation, observation-only
+eligibility, permissions, audit and resource limits.
+
 The gateway validates arguments against bounded local JSON schemas, including
 arguments changed by hooks. Reviews, staged preparation, scope grants and
 publication retain their authorization boundaries. Critical operations require
