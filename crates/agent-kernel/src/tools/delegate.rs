@@ -1373,7 +1373,7 @@ impl SubagentSpawner {
         // The child's turn contracts run the host's policy shape over the
         // child's own context — the factory installs the child's contract
         // controllers as part of that, so it needs the ctx mutable.
-        let child_scope = if let Some(scope) = &scope {
+        let (child_scope, child_execution) = if let Some(scope) = &scope {
             let parent_call = parent_ctx
                 .ext
                 .get::<crate::invocation_scope::InvocationParent>()
@@ -1384,11 +1384,21 @@ impl SubagentSpawner {
                 .ok_or("missing scoped child services")?)(
                 &parent_ctx, &mut child_ctx
             )?;
+            if services.strategy == crate::code_mode::EngineStrategy::CodeMode
+                && services.code_mode_handler.is_none()
+            {
+                return Err("scoped Code Mode delegation requires a Code Mode handler".into());
+            }
+            let execution = (
+                services.strategy,
+                services.code_mode_handler.clone(),
+                services.max_code_mode_tool_calls,
+            );
             let binding = scope.child(child_id.to_string(), parent_call.0.clone(), services);
             child_ctx.ext.insert(binding.clone());
-            Some(binding)
+            (Some(binding), Some(execution))
         } else {
-            None
+            (None, None)
         };
         let policy = (self.policy)(&parent_ctx, &mut child_ctx);
         // The child's provider records the history of every request behind it, so
@@ -1405,6 +1415,13 @@ impl SubagentSpawner {
             route.temperature,
         );
         engine.set_policy(policy);
+        if let Some((strategy, handler, max_tool_calls)) = child_execution {
+            engine.set_strategy(strategy);
+            if let Some(handler) = handler {
+                engine.set_code_mode_handler(handler);
+            }
+            engine.set_max_code_mode_tool_calls(max_tool_calls);
+        }
         if let Some(binding) = &child_scope {
             engine.set_hooks(binding.hooks.clone());
             if let Some(plugins) = &binding.plugins {

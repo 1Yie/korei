@@ -39,6 +39,9 @@ pub(crate) struct ScopeBinding {
 pub struct ScopedChildServices {
     pub hooks: HookChain,
     pub plugins: Option<PluginHandle>,
+    pub strategy: crate::code_mode::EngineStrategy,
+    pub code_mode_handler: Option<Arc<dyn crate::code_mode::CodeModeHandler>>,
+    pub max_code_mode_tool_calls: Option<usize>,
 }
 
 pub type ScopedChildFactory =

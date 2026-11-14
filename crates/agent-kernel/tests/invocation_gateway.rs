@@ -6,6 +6,9 @@ use std::time::Duration;
 
 use agent_ipc::UiEvent;
 use agent_kernel::channels::{UiReceiver, UiSink};
+use agent_kernel::code_mode::{
+    CodeModeContext, CodeModeHandler, CodeModeOutcome, CodeModeRequest, EngineStrategy,
+};
 use agent_kernel::engine::{Engine, EngineIo, ModeEntry};
 use agent_kernel::hooks::{AgentHook, HookChain};
 use agent_kernel::invocation::{
@@ -715,6 +718,9 @@ async fn scoped_background_children_require_bound_services_keep_own_authority_an
                     Ok(ScopedChildServices {
                         hooks,
                         plugins: None,
+                        strategy: EngineStrategy::ReAct,
+                        code_mode_handler: None,
+                        max_code_mode_tool_calls: None,
                     })
                 }))
                 .with_policy(Arc::new(|parent, child| {
@@ -824,6 +830,271 @@ async fn scoped_background_children_require_bound_services_keep_own_authority_an
             .any(|a| a.metadata.invocation_id == "child-read"
                 && a.status == InvocationStatus::Cancelled));
         assert!(phases.lock().unwrap().contains(&"state:43".to_string()));
+    }
+}
+
+#[derive(Default)]
+struct ScopedChildCodeMode {
+    remaining: Mutex<Vec<usize>>,
+    finished: AtomicUsize,
+}
+
+#[async_trait]
+impl CodeModeHandler for ScopedChildCodeMode {
+    async fn execute(&self, program: CodeModeRequest, ctx: CodeModeContext<'_>) -> CodeModeOutcome {
+        assert_eq!(ctx.engine.strategy(), EngineStrategy::CodeMode);
+        assert_eq!(scope_probe(ctx.tool_ctx, "child-handler"), 43);
+        assert!(agent_kernel::invocation_scope::is_invocation_scoped(
+            ctx.tool_ctx
+        ));
+        let identity = ctx.parent_identity.unwrap();
+        assert_eq!(identity.execution_id, "trusted-execution");
+        assert_ne!(identity.agent_id, "trusted-agent");
+        assert!(ctx.parent_deadline.is_some());
+        self.remaining
+            .lock()
+            .unwrap()
+            .push(ctx.remaining_tool_calls);
+        let gateway = ctx.engine.invocation_gateway(ctx.io, ctx.turn, None);
+        assert!(gateway
+            .list()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.name == "read"));
+        assert!(gateway.describe("write").is_err());
+        let wait = program.params["wait"].as_bool().unwrap();
+        assert_eq!(
+            identity.parent_call_id.as_deref(),
+            Some(if wait { "code-blocked" } else { "code-child" })
+        );
+        let read = gateway
+            .invoke(request(
+                if wait {
+                    "code-blocked-read"
+                } else {
+                    "code-read"
+                },
+                "read",
+                if wait {
+                    r#"{"value":2}"#
+                } else {
+                    r#"{"value":1}"#
+                },
+            ))
+            .await;
+        let second = if wait {
+            assert_eq!(read.status, InvocationStatus::Cancelled);
+            assert!(gateway.list().is_err());
+            gateway
+                .invoke(request("code-late", "read", r#"{"value":1}"#))
+                .await
+        } else {
+            assert!(read.ok(), "{}", read.content);
+            gateway
+                .invoke(request("code-write", "write", r#"{"value":1}"#))
+                .await
+        };
+        assert!(!second.ok());
+        if wait {
+            assert_eq!(second.status, InvocationStatus::Cancelled);
+            assert!(!second.attempted);
+        }
+        self.finished.fetch_add(1, Ordering::SeqCst);
+        CodeModeOutcome {
+            model_result: "child gateway checked".into(),
+            is_error: wait,
+            attempted_calls: usize::from(read.attempted) + usize::from(second.attempted),
+            stop_reason: read.audit.stop_reason,
+        }
+    }
+}
+
+#[tokio::test]
+async fn scoped_code_mode_children_require_a_handler_and_keep_child_authority() {
+    use agent_kernel::tools::delegate::{self, ChildRoute, SubagentSpawner};
+    use agent_llm_core::types::StreamChunk;
+
+    let phases = Arc::new(Mutex::new(Vec::new()));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let reads = Arc::new(AtomicUsize::new(0));
+    let writes = Arc::new(AtomicUsize::new(0));
+    let provider = Arc::new(ScriptedProvider::new());
+    let program = |wait| {
+        vec![
+            StreamChunk::ToolCallDelta {
+                slot: 0,
+                id: Some("child-program".into()),
+                name: Some("execute_code".into()),
+                args_delta: json!({"code":"return params", "params":{"wait":wait}}).to_string(),
+            },
+            StreamChunk::Done {
+                prompt_tokens: None,
+                completion_tokens: None,
+                cached_tokens: None,
+            },
+        ]
+    };
+    provider.push_script(program(false));
+    provider.script_text("child complete");
+    provider.push_script(program(true));
+    let mut read = tool("read", true, reads.clone());
+    let (read_entered, read_dropped, read_runs) = (entered.clone(), dropped.clone(), reads.clone());
+    read.exec = Arc::new(move |args, ctx| {
+        let (entered, dropped, reads) = (
+            read_entered.clone(),
+            read_dropped.clone(),
+            read_runs.clone(),
+        );
+        async move {
+            assert_eq!(scope_probe(&ctx, "child-dispatch"), 43);
+            reads.fetch_add(1, Ordering::SeqCst);
+            if args["value"] == 2 {
+                let _drop = AuditDrop(&dropped);
+                entered.notify_one();
+                futures::future::pending::<()>().await;
+            }
+            Ok(ToolResult::text("read complete"))
+        }
+        .boxed()
+    });
+    let mut registry = ToolRegistry::new();
+    registry.register(read);
+    registry.register(tool("write", false, writes.clone()));
+    let readonly = Arc::new(registry.filtered(|spec| spec.readonly));
+    let handler = Arc::new(ScopedChildCodeMode::default());
+    let ready = Arc::new(AtomicBool::new(false));
+    let (factory_handler, factory_ready) = (handler.clone(), ready.clone());
+    let spawner = SubagentSpawner::new(
+        Arc::new(std::sync::RwLock::new(ChildRoute {
+            provider: provider.clone(),
+            model: "scripted".into(),
+            temperature: 0.0,
+            context_window: 100_000,
+            thinking_level: None,
+            thinking_level_map: None,
+            model_params: Default::default(),
+            model_input: vec![],
+            models: Default::default(),
+        })),
+        Arc::new(registry),
+        readonly,
+    )
+    .with_scoped_services(Arc::new(move |parent, child| {
+        let marker = parent.require::<ScopeProbe>("parent probe").unwrap();
+        child.ext.insert(Arc::new(ScopeProbe {
+            value: 43,
+            phases: marker.phases.clone(),
+        }));
+        let hooks = HookChain::new();
+        hooks.replace(vec![Arc::new(ScopeHooks)]);
+        Ok(ScopedChildServices {
+            hooks,
+            plugins: None,
+            strategy: EngineStrategy::CodeMode,
+            code_mode_handler: factory_ready
+                .load(Ordering::SeqCst)
+                .then(|| factory_handler.clone() as Arc<dyn CodeModeHandler>),
+            max_code_mode_tool_calls: Some(2),
+        })
+    }));
+    let session = -5012;
+    let mut ctx = ToolCtx::new().with_session(session);
+    ctx.ext.insert(Arc::new(ScopeProbe {
+        value: 42,
+        phases: phases.clone(),
+    }));
+    ctx.install_subagent(spawner);
+    let global_cancel = Arc::new(AtomicBool::new(false));
+    delegate::install_background_cancel(&mut ctx, global_cancel.clone());
+    let (mut engine, io, _) = harness(vec![delegate::spec()]);
+    let sink = Arc::new(EffectAudit::default());
+    let scope = test_scope(
+        ctx,
+        HookChain::new(),
+        None,
+        Some(sink.clone()),
+        Some(std::time::Instant::now() + Duration::from_secs(30)),
+    );
+    let turn = engine.begin_invocation_turn();
+    let gateway = engine
+        .invocation_gateway(&io, &turn, None)
+        .with_scope(&scope);
+    let missing = gateway
+        .invoke(request(
+            "code-missing",
+            "delegate",
+            r#"{"task":"inspect","readonly":true}"#,
+        ))
+        .await;
+    assert!(!missing.ok());
+    assert!(
+        missing
+            .content
+            .contains("scoped Code Mode delegation requires a Code Mode handler"),
+        "{}",
+        missing.content
+    );
+    assert!(provider.calls.lock().unwrap().is_empty());
+    assert!(delegate::active_children(session).is_empty());
+    assert_eq!(reads.load(Ordering::SeqCst), 0);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    ready.store(true, Ordering::SeqCst);
+    let completed = gateway
+        .invoke(request(
+            "code-child",
+            "delegate",
+            r#"{"task":"inspect","readonly":true}"#,
+        ))
+        .await;
+    assert!(completed.ok(), "{}", completed.content);
+    assert!(completed.content.contains("child complete"));
+    assert!(
+        gateway.list().is_ok(),
+        "child completion preserves parent lifetime"
+    );
+    assert_eq!(provider.tool_names.lock().unwrap()[0], ["execute_code"]);
+    assert!(provider.tool_names.lock().unwrap()[1].is_empty());
+    let background = gateway
+        .invoke(request(
+            "code-blocked",
+            "delegate",
+            r#"{"task":"wait","readonly":true,"background":true}"#,
+        ))
+        .await;
+    assert!(background.ok(), "{}", background.content);
+    tokio::time::timeout(Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    scope.close().await.unwrap();
+    assert_eq!(*handler.remaining.lock().unwrap(), [2, 2]);
+    assert_eq!(handler.finished.load(Ordering::SeqCst), 2);
+    assert_eq!(reads.load(Ordering::SeqCst), 2);
+    assert_eq!(writes.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    assert!(delegate::active_children(session).is_empty());
+    assert!(!global_cancel.load(Ordering::SeqCst));
+    assert!(!io.cancel.load(Ordering::SeqCst));
+    let phases = phases.lock().unwrap();
+    for phase in ["before:43", "after:43", "child-dispatch:43", "state:43"] {
+        assert!(phases.iter().any(|value| value == phase), "{phases:?}");
+    }
+    let audits = sink.finishes.lock().unwrap();
+    for (call, parent) in [
+        ("code-read", "code-child"),
+        ("code-write", "code-child"),
+        ("code-blocked-read", "code-blocked"),
+    ] {
+        let audit = audits
+            .iter()
+            .find(|audit| audit.metadata.invocation_id == call)
+            .unwrap();
+        assert_eq!(
+            audit.metadata.execution_id.as_deref(),
+            Some("trusted-execution")
+        );
+        assert_eq!(audit.metadata.parent_call_id.as_deref(), Some(parent));
+        assert_ne!(audit.metadata.agent_id.as_deref(), Some("trusted-agent"));
     }
 }
 

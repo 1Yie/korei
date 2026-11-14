@@ -144,8 +144,13 @@ retains its session behavior.
 
 `SubagentSpawner::with_scoped_services` is required for scoped delegation. Its
 factory receives the current parent context and a fresh child context and
-returns child hooks and an optional child plugin handle. It must install the
-child's execution-bound host capabilities explicitly. `with_policy` likewise
+returns `ScopedChildServices`: child hooks, an optional plugin handle, execution
+strategy, optional Code Mode handler and optional Code Mode call cap. Code Mode
+requires a handler before the child starts; ReAct callers select `ReAct` with no
+handler or Code Mode cap. The cap uses the engine's existing turn allowance,
+with `None` preserving its default. The factory installs the child's
+execution-bound host capabilities explicitly; inheritable parent extensions
+remain available in the fresh child context. `with_policy` likewise
 receives both contexts and installs the child's own product controllers. Core
 keeps the child's own registry, permission gate and headless restrictions;
 parent bypass and session approvals do not become child authority. Child audit
