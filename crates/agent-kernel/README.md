@@ -11,7 +11,7 @@ Providers, tools and host policy enter through the contracts exported by
 `Arc<dyn CodeModeHandler>` with `set_code_mode_handler`. The public contract
 lives in [`code_mode`](src/code_mode.rs). Both strategies use the same turn
 loop and neutral provider tool-call/result protocol. Code Mode exposes only
-the `execute_code` schema; the registry is used for actual capabilities, never
+the `code_mode` schema; the registry is used for actual capabilities, never
 to resolve the control handler. A response mixing control and direct capability
 calls is rejected as a whole. Missing handlers and invalid requests fail closed.
 

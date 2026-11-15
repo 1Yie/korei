@@ -44,7 +44,7 @@ fn call(slot: usize, name: &str, args: impl Into<String>) -> StreamChunk {
 fn program(slot: usize, attempts: usize) -> StreamChunk {
     call(
         slot,
-        "execute_code",
+        "code_mode",
         json!({"code":"return params", "params":{"attempts":attempts}}).to_string(),
     )
 }
@@ -192,7 +192,7 @@ impl Harness {
         provider.script_text("final");
         let capabilities = Arc::new(AtomicUsize::new(0));
         let mut registry = ToolRegistry::new();
-        for name in ["probe", "execute_code"] {
+        for name in ["probe", "code_mode"] {
             let count = capabilities.clone();
             registry.register(ToolSpec {
                 name,
@@ -292,7 +292,7 @@ async fn control_uses_borrowed_host_gateway_and_only_projection_enters_history()
     let mut h = Harness::new(FakeHost::default(), vec![vec![program(0, 1)]]);
     assert_eq!(h.run().await.unwrap().tool_calls_run, 1);
     assert_eq!(h.capabilities.load(Ordering::Relaxed), 1);
-    assert_eq!(h.provider.tool_names.lock().unwrap()[0], ["execute_code"]);
+    assert_eq!(h.provider.tool_names.lock().unwrap()[0], ["code_mode"]);
     assert!(h.history.iter().all(|message| !message
         .content
         .as_deref()
@@ -342,26 +342,26 @@ async fn control_uses_borrowed_host_gateway_and_only_projection_enters_history()
 #[tokio::test]
 async fn invalid_oversize_mixed_and_direct_calls_never_reach_handler_or_capabilities() {
     let cases = [
-        vec![call(0, "execute_code", r#"{"code":2,"params":{}}"#)],
+        vec![call(0, "code_mode", r#"{"code":2,"params":{}}"#)],
         vec![call(
             0,
-            "execute_code",
+            "code_mode",
             r#"{"code":"return 1","params":{},"scope":{}}"#,
         )],
         vec![call(
             0,
-            "execute_code",
+            "code_mode",
             r#"{"code":"return 1","params":{},"limits":1}"#,
         )],
-        vec![call(0, "execute_code", r#"{"code":"return 1"}"#)],
+        vec![call(0, "code_mode", r#"{"code":"return 1"}"#)],
         vec![call(
             0,
-            "execute_code",
+            "code_mode",
             r#"{"code":"return 1","params":{},"stop_reason":{"UserRejected":{"request_id":1}}}"#,
         )],
         vec![call(
             0,
-            "execute_code",
+            "code_mode",
             json!({"code":"x".repeat(65536),"params":{}}).to_string(),
         )],
         vec![program(0, 1), call(1, "probe", "{}")],
@@ -535,7 +535,7 @@ fn control_schema_is_neutral_and_matches_approved_model_text() {
     let schema = control_schema();
     let function = &schema["function"];
     assert_eq!(schema["type"], "function");
-    assert_eq!(function["name"], "execute_code");
+    assert_eq!(function["name"], "code_mode");
     assert_eq!(
         function["parameters"]["properties"]["code"]["description"],
         "JavaScript async function body."
@@ -549,7 +549,7 @@ fn control_schema_is_neutral_and_matches_approved_model_text() {
         "Optional requested execution limits, clamped to host limits."
     );
     assert_eq!(function["description"],
-        "Run a JavaScript async function body to orchestrate authorized tools.\nDiscover names with tools.list({cursor: null}), inspect schemas with\ntools.describe(name), and invoke tools with await tools.call(name, args).\nUse params for input data, console for bounded diagnostics, and return\nthe JSON result needed by the model. Files, network, environment, and\nmodule loading are available only through authorized tools.\nA human refusal ends this program and returns control to the model.");
+        "Carry out this turn as one code_mode program. Browsing, todos, and file edits inside it share one private workspace and are not separate tool calls. The JSON result is the only record that comes back into context. File edits stay private until they are published.\nDiscover tools with tools.list({cursor: null}), read one schema with tools.describe(name), and invoke it with await tools.call(name, args). Use params for input data and console for bounded diagnostics. Files, network, environment, and module loading are available only through authorized tools.\nA human refusal ends this program and returns control to the model.");
     let encoded = schema.to_string();
     for vendor_field in ["input_schema", "strict", "allowed_callers", "defer_loading"] {
         assert!(!encoded.contains(vendor_field));
@@ -624,7 +624,7 @@ async fn outer_control_state_is_ui_only_before_host_scope_exists() {
     assert!(events.iter().any(|event| matches!(
         event,
         UiEvent::StateChanged(AgentState::ExecutingTool { tool_name })
-            if tool_name == "execute_code"
+            if tool_name == "code_mode"
     )));
 }
 
@@ -642,7 +642,7 @@ async fn react_tool_state_and_lifecycle_hooks_keep_root_context() {
         .unwrap();
     assert_eq!(
         *probe.tool_states.lock().unwrap(),
-        [("execute_code".into(), false)]
+        [("code_mode".into(), false)]
     );
     assert_eq!(probe.tool_effects.load(Ordering::Relaxed), 1);
     assert!(probe.reasoning.load(Ordering::Relaxed) > 0);

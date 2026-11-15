@@ -1370,7 +1370,9 @@ impl Engine {
                         .max_code_mode_tool_calls
                         .map_or(usize::MAX, |limit| limit.saturating_sub(tool_calls_run));
                     let rejection = if mixed_code_mode_round {
-                        Some("Code Mode accepts only execute_code control calls".to_string())
+                        Some(format!(
+                        "Code Mode accepts only {CONTROL_TOOL_NAME} control calls"
+                    ))
                     } else if let Some(reason) = &code_mode_stop {
                         Some(format!(
                             "program skipped after prior control stop: {reason:?}"

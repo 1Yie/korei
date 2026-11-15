@@ -925,7 +925,7 @@ async fn scoped_code_mode_children_require_a_handler_and_keep_child_authority() 
             StreamChunk::ToolCallDelta {
                 slot: 0,
                 id: Some("child-program".into()),
-                name: Some("execute_code".into()),
+                name: Some("code_mode".into()),
                 args_delta: json!({"code":"return params", "params":{"wait":wait}}).to_string(),
             },
             StreamChunk::Done {
@@ -1053,7 +1053,7 @@ async fn scoped_code_mode_children_require_a_handler_and_keep_child_authority() 
         gateway.list().is_ok(),
         "child completion preserves parent lifetime"
     );
-    assert_eq!(provider.tool_names.lock().unwrap()[0], ["execute_code"]);
+    assert_eq!(provider.tool_names.lock().unwrap()[0], ["code_mode"]);
     assert!(provider.tool_names.lock().unwrap()[1].is_empty());
     let background = gateway
         .invoke(request(

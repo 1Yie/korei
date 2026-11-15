@@ -9,7 +9,7 @@ use crate::{
     invocation::{InvocationStopReason, InvocationTurn},
 };
 
-pub const CONTROL_TOOL_NAME: &str = "execute_code";
+pub const CONTROL_TOOL_NAME: &str = "code_mode";
 pub const MAX_MODEL_RESULT_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub fn control_schema() -> Value {
         "type": "function",
         "function": {
             "name": CONTROL_TOOL_NAME,
-            "description": "Run a JavaScript async function body to orchestrate authorized tools.\nDiscover names with tools.list({cursor: null}), inspect schemas with\ntools.describe(name), and invoke tools with await tools.call(name, args).\nUse params for input data, console for bounded diagnostics, and return\nthe JSON result needed by the model. Files, network, environment, and\nmodule loading are available only through authorized tools.\nA human refusal ends this program and returns control to the model.",
+            "description": "Carry out this turn as one code_mode program. Browsing, todos, and file edits inside it share one private workspace and are not separate tool calls. The JSON result is the only record that comes back into context. File edits stay private until they are published.\nDiscover tools with tools.list({cursor: null}), read one schema with tools.describe(name), and invoke it with await tools.call(name, args). Use params for input data and console for bounded diagnostics. Files, network, environment, and module loading are available only through authorized tools.\nA human refusal ends this program and returns control to the model.",
             "parameters": {
                 "type": "object",
                 "properties": {
