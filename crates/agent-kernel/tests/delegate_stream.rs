@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use agent_ipc::events::UiEvent;
 use agent_kernel::channels::UiSink;
-use agent_kernel::tools::delegate::{spec, ChildRoute, SubagentSpawner};
+use agent_kernel::tools::delegate::{
+    active_children, spec, wait_child_spec, ChildRoute, SubagentSpawner,
+};
 use agent_kernel::tools::{ToolCtx, ToolRegistry};
 use agent_testkit::ScriptedProvider;
 
@@ -57,6 +59,66 @@ async fn nested_events_carry_the_child_id() {
         assert_eq!(parent.as_deref(), Some("subagent"), "nested under the card");
         assert_eq!(child_id, Some(id), "a nested delta must name its child");
     }
+}
+
+/// Three children that all finish must leave the registry and must not be
+/// reported as still running. A parent that then waits is released by the
+/// terminal handoff instead of parking on a child that has already exited.
+#[tokio::test]
+async fn finished_parallel_children_do_not_leave_the_parent_waiting() {
+    let provider = Arc::new(ScriptedProvider::new());
+    provider.script_text("alpha");
+    provider.script_text("beta");
+    provider.script_text("gamma");
+    let (sink, mut rx) = UiSink::channel();
+    let mut ctx = ToolCtx::new().with_session(7);
+    ctx.install_subagent(spawner(provider));
+    ctx.install_ui(sink);
+    agent_kernel::tools::delegate::install_child_notifier(&mut ctx, |_| {});
+    let ctx = Arc::new(ctx);
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        (spec().exec)(
+            serde_json::json!({"tasks": ["a", "b", "c"], "readonly": true}),
+            ctx.clone(),
+        ),
+    )
+    .await
+    .expect("parallel children must finish")
+    .expect("delegation succeeds")
+    .content;
+    assert!(
+        !result.contains("still running"),
+        "finished children must not stay in progress: {result}"
+    );
+    assert!(
+        active_children(7).is_empty(),
+        "finished children must leave the registry"
+    );
+
+    let mut finished = 0;
+    while let Some(ev) = rx.try_recv() {
+        if let UiEvent::ToolCallFinished {
+            parent: Some(parent),
+            child_id: Some(_),
+            ..
+        } = ev
+        {
+            if parent == "delegate" {
+                finished += 1;
+            }
+        }
+    }
+    assert_eq!(finished, 3, "each child card closes when its turn returns");
+
+    let waited = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        (wait_child_spec().exec)(serde_json::json!({"child_id": 1}), ctx),
+    )
+    .await
+    .expect("a wait for an already finished child must return");
+    assert!(waited.is_ok(), "the parent is not left waiting: {waited:?}");
 }
 
 /// The card's task text is the whole task, not a preview cut to fit the card.

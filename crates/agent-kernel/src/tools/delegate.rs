@@ -1538,13 +1538,20 @@ impl SubagentSpawner {
     }
 
     fn child_exited(&self, session: i64, id: u64) {
-        let parked = self
+        // A child that left the registry without a terminal handoff must not
+        // stay `Pending`: `wait_child` would block on a process that is gone.
+        let open = self
             .handoffs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(session, id))
-            .is_some_and(|sender| matches!(*sender.borrow(), HandoffState::Question));
-        if parked {
+            .is_some_and(|sender| {
+                matches!(
+                    *sender.borrow(),
+                    HandoffState::Pending | HandoffState::Question
+                )
+            });
+        if open {
             self.deliver_handoff(session, id, HandoffState::Cancelled);
         }
     }
@@ -1827,18 +1834,9 @@ impl ChildRun {
                 &outcome.text,
             )),
         };
-        // Kept whatever the outcome: a cancelled or failed child is exactly the
-        // one an operator wants to read back.
-        host.persist(&parent, id, &label, &history);
-        // Close the child's stream first: dropping the engine and io releases
-        // every sink clone, so the forwarder drains and exits, and only then
-        // does the card finish.
-        drop(io);
-        drop(engine);
-        forward_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        if let Some(forwarder) = forwarder {
-            let _ = forwarder.await;
-        }
+        // The card and the parent handoff are published before persistence and
+        // before the UI forwarder drains. A stalled drain must not leave the
+        // child looking active or leave `wait_child` parked on it.
         let done = match &report {
             Ok(text) => {
                 card.close(true, text);
@@ -1855,9 +1853,22 @@ impl ChildRun {
                 }
             }
         };
-        // Last: the parent side wakes up only once the card it will read is
-        // already finished.
         let _ = outcomes.try_send(done);
+        deliver_handoff(
+            &parent,
+            id,
+            match &report {
+                Err(error) if is_cancel_marker(error) => HandoffState::Cancelled,
+                _ => HandoffState::Finished,
+            },
+        );
+        host.persist(&parent, id, &label, &history);
+        drop(io);
+        drop(engine);
+        forward_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(forwarder) = forwarder {
+            let _ = forwarder.await;
+        }
     }
 }
 
@@ -2304,6 +2315,12 @@ async fn wait_child_exec(args: Args, ctx: Arc<ToolCtx>) -> Result<ToolResult, To
                 return Err(ToolError::Failed(cancel_marker(parsed.child_id)));
             }
             HandoffState::Pending => {
+                if !active_children(ctx.session().unwrap_or(0)).contains(&parsed.child_id) {
+                    return Ok(ToolResult::text(format!(
+                        "subagent {} is no longer running; read any already-delivered update",
+                        parsed.child_id
+                    )));
+                }
                 if ctx.ext.get::<ChildNotifier>().is_none() {
                     return Err(ToolError::Failed(
                         "waiting for background children requires a parent notice notifier".into(),
